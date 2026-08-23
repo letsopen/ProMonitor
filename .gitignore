@@ -1,19 +1,16 @@
-# 依赖
 node_modules/
-
-# 构建产物
 dist/
-
-# 环境变量（含数据库密码，勿提交）
+bin/
+.gotool/
+*.db
+*.db-shm
+*.db-wal
+smoke*.log
 .env
 .env.local
-*.local
 
-# 日志
-*.log
-
-# 操作系统 / 编辑器
-.DS_Store
-Thumbs.db
-.idea/
-.vscode/
+# IDE / 工具内部数据（不应发布到仓库）
+.workbuddy/
+.plan/
+.todo/
+.websearch/

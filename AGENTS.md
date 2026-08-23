@@ -1,28 +1,107 @@
 # 项目技术上下文
 
-## Dependencies
-- **element-plus**: Vue3 UI组件库，用于管理后台界面
-- **echarts**: 数据可视化图表库
-- **axios**: HTTP客户端，用于API请求
-- **pinia**: Vue状态管理
-- **vue-router**: Vue路由管理
-- **express**: Node.js Web框架（后端）
-- **@supabase/supabase-js**: PostgreSQL数据库客户端（后端）
-- **cors**: 跨域支持（后端）
+## 技术栈（v4 自托管 · Docker / Alpine 部署）
+- **主控后端**: Go（CGO_ENABLED=0 静态二进制），监听 `:9000`，同时托管前端 `dist/`
+- **被控 Agent**: Go 单二进制，零运行时依赖，每 30s 上报
+- **前端**: Vue3 + Vite + Element Plus（单页应用）
+- **数据库**: SQLite（单文件 `promonitor.db`，WAL 模式，纯 Go 驱动 modernc，无 cgo）
+- **部署**: Docker，运行期基础镜像 **Alpine 3.21**；构建期 `golang:1.23-alpine`
+- **源码构建下限**: Go ≥ 1.20（modernc.org/sqlite 要求 1.20、gopsutil/v4 要求 1.18）。
+  目标机无需装 Go——Docker 构建在 builder 阶段完成，或直接使用 `bin/` 预编译静态二进制。
 
-## Architecture
-- **前端**: Vue3 + Vite + Element Plus，单页应用
-- **后端**: Node.js + Express，RESTful API
-- **数据库**: PostgreSQL (Meoo Cloud)，通过REST API连接
-- **数据采集**: Bash脚本，每5分钟通过crontab执行
-
-## Data Flow
+## 目录结构
 ```
-被控Shell脚本 --HTTP POST--> Node.js后端 --存储--> PostgreSQL
-                                          |
-Vue前端 <--HTTP GET-- Node.js后端 <--读取-- PostgreSQL
+server/      Go 主控后端
+  cmd/server/main.go        入口：聚合器+API+静态托管+30天保留清理
+  internal/config           环境变量
+  internal/store            SQLite 存储层（modernc 纯 Go 驱动，内联 schema，无 cgo、无 embed）
+  internal/ingest           HMAC 验签 + 写入聚合缓冲
+  internal/aggregator      按测量时间对齐的 10 分钟桶均值聚合（首次上报即 UpsertServer 注册）
+  internal/auth            单 admin 登录/会话/中间件
+  internal/api             HTTP 路由与处理器
+  internal/metrics         共享类型
+agent/       Go 被控 Agent（gopsutil 采集 + HMAC 上报）
+migrations/  SQLite 建表 SQL 参考（实际由 server 启动时自动执行内联 schema）
+scripts/     smoke.mjs（端到端冒烟测试）
+src/         Vue 前端
+bin/         预编译静态二进制（linux amd64/arm64，供非 Docker 部署直接取用）
+Dockerfile / docker-compose.yml / .dockerignore   容器化部署
 ```
 
-## Security
-- HMAC-SHA256签名验签保障数据采集安全
-- 预共享密钥在创建服务器时生成，需妥善保存
+## 架构与数据流
+```
+被控Agent(Go) --HMAC签名 POST--> 主控 /api/ingest --按测量时间聚合--> SQLite(metrics_agg)
+        |                                              |                          |
+        |--GET /api/ping-config(每5分钟)--> 探测配置     latest_snapshot   30天保留(DELETE+VACUUM)
+        |   (主控统一管理 PING_METHOD/PING_PORT/PING_NODES)                       |
+Vue前端 <--GET /api/servers(轮询10s)-- 读取最新快照(latest_snapshot JOIN)
+Vue前端 <--GET /api/servers/:id/metrics-- 读取30天聚合历史
+```
+
+## 关键设计决策
+- **高频原始数据不落库**：`/api/ingest` 仅验签 + 写入进程内内存聚合缓冲；每 10 分钟结算 1 行均值落库。
+- **数据时间 = 被控测量时间**：样本 `ts` 为测量时间（unix 秒），聚合按 `floor(ts/600)*600` 对齐到 10 分钟桶，落库 `ts` 即桶起点。网络故障积压的数据补传后落在真实时间点，不污染恢复时刻的曲线。
+- **ping 节点主控统一下发**：`GET /api/ping-config`（匿名）返回 `{method, port, nodes}`；被控启动拉取 + 每 5 分钟热更新；`-targets` 仅作主控未配置时的回退。
+- **被控积压重试**：Agent 内存队列（上限 500）+ 指数退避重试（2s→60s，最多 5 次），失败不丢数据，恢复自动续传。
+- **缓存 = 纯进程内内存**，无 Redis（资源敏感、单实例）。
+- **首次上报即注册**：聚合器在窗口首次出现该 server 时异步 `UpsertServer`，被控无需先在管理页添加。
+- **30 天保留**：SQLite 不做分区，应用层每日 `PruneOld(30)` 删除过期行并 `VACUUM`。
+- **ping 无效判定**：延迟 >1000ms 不计入均值（哨兵值 -1）。
+- **鉴权**：单 admin，密码 bcrypt + httpOnly Cookie 签名会话；列表/详情匿名，管理页 `RequireAdmin` 中间件服务端拦截。
+- **SQLite 连接策略**：WAL + busy_timeout + 单连接串行，避免 `database is locked`。
+- **前端托管**：主控直接用 `http.FileServer` + NotFound 回退托管 `dist/`，支持 Vue History 路由；无需 nginx（公网 HTTPS 时再前置 nginx）。
+
+## 安全
+- 被控上报：HMAC-SHA256 签名验签（预共享 `HMAC_SECRET`），请求头 `X-Signature`。
+- 管理接口：登录限流 + Cookie 防 CSRF（SameSite）+ 密码 bcrypt 哈希。
+- 传输安全：自托管/容器内由前置 nginx 反代终结 TLS（主控本身不内置 HTTPS）。
+
+## 环境变量（主控）
+`DB_PATH`(必填，容器默认 /app/data/promonitor.db) / `HMAC_SECRET`(必填) / `ADMIN_USER`(默认 admin) / `ADMIN_PASS`(首次种子) / `SESSION_SECRET` / `PORT`(默认 9000) / `FRONTEND_DIR`(默认 ./dist) / `PING_METHOD`(默认 tcp) / `PING_PORT`(默认 80) / `PING_NODES`(逗号分隔，≤50)
+
+## 部署（Docker，推荐）
+
+### docker run（推荐，主控）
+```
+# TCP 探测（默认）
+docker run -d --name promonitor --restart unless-stopped -p 9000:9000 \
+  -e HMAC_SECRET='<随机长串>' -e ADMIN_PASS='<初始密码>' -e SESSION_SECRET='<随机串>' \
+  -e PING_METHOD=tcp -e PING_PORT=80 -e PING_NODES='8.8.8.8,1.1.1.1' \
+  -v promonitor-data:/app/data promonitor:latest
+
+# ICMP 探测：必须加 --cap-add NET_RAW（Alpine 默认无 CAP_NET_RAW，不加则探测全失败）
+docker run -d --name promonitor --restart unless-stopped -p 9000:9000 --cap-add NET_RAW \
+  -e HMAC_SECRET='<随机长串>' -e ADMIN_PASS='<初始密码>' -e SESSION_SECRET='<随机串>' \
+  -e PING_METHOD=icmp -e PING_NODES='8.8.8.8,1.1.1.1' \
+  -v promonitor-data:/app/data promonitor:latest
+# 访问 http://<host>:9000 ；数据持久化在 promonitor-data 卷
+```
+
+### docker run（被控 Agent）
+```
+# TCP 探测（跟随主控配置）
+docker run -d --name promonitor-agent --restart unless-stopped --network host \
+  -e MASTER_URL='http://<主控IP>:9000' -e HMAC_SECRET='<与主控一致>' \
+  -e SERVER_ID='web-01' -e SERVER_NAME='阿里云-杭州' -e SERVER_IP='10.0.0.5' \
+  promonitor:latest promonitor-agent
+
+# ICMP 探测：同样需要 --cap-add NET_RAW
+docker run -d --name promonitor-agent --restart unless-stopped --network host --cap-add NET_RAW \
+  -e MASTER_URL='http://<主控IP>:9000' -e HMAC_SECRET='<与主控一致>' \
+  -e SERVER_ID='web-01' -e SERVER_NAME='阿里云-杭州' -e SERVER_IP='10.0.0.5' \
+  promonitor:latest promonitor-agent
+```
+
+### docker compose（备选）
+```
+cp .env.example .env      # 填 HMAC_SECRET、ADMIN_PASS，可选填 PING_*
+docker compose up -d --build
+# 访问 http://<host>:9000 ；数据持久化在 promonitor-data 卷
+# 使用 ICMP 时需在 docker-compose.yml 的 promonitor 服务加 cap_add: [NET_RAW]
+```
+
+## 被控 Agent 启动参数
+`-master MASTER_URL` / `-secret HMAC_SECRET`(必填) / `-id SERVER_ID`(必填) / `-name` / `-ip` / `-targets`(可选覆盖) / `-interval`(默认30s)
+对应环境变量：MASTER_URL / HMAC_SECRET / SERVER_ID / SERVER_NAME / SERVER_IP / PING_TARGETS。
+延迟节点与方法由主控统一下发（Agent 拉取 `/api/ping-config`，每 5 分钟热更新）；`-targets` 仅当主控未配置节点时回退使用。
+Agent 内置内存积压队列 + 指数退避重试，网络故障期间数据暂存、恢复后自动续传。

@@ -1,0 +1,26 @@
+services:
+  promonitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: promonitor:latest
+    container_name: promonitor
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    environment:
+      PORT: "9000"
+      DB_PATH: "/app/data/promonitor.db"
+      # 以下变量来自同目录的 .env（docker compose 自动读取）
+      HMAC_SECRET: "${HMAC_SECRET}"
+      ADMIN_PASS: "${ADMIN_PASS}"
+      SESSION_SECRET: "${SESSION_SECRET:-change-me-session-secret}"
+      # 网络延迟探测配置（被控通过 /api/ping-config 拉取）
+      PING_METHOD: "${PING_METHOD:-tcp}"
+      PING_PORT: "${PING_PORT:-80}"
+      PING_NODES: "${PING_NODES:-}"
+    volumes:
+      - promonitor-data:/app/data
+
+volumes:
+  promonitor-data:
