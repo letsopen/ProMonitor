@@ -53,7 +53,7 @@ bin/       预编译静态二进制（linux amd64/arm64，供非 Docker 部署�
 ### 方式 0：直接从 GitHub 拉取镜像（无需本地构建）
 
 项目已配置 GitHub Actions 流水线：push 到 `main` 自动构建并推送镜像到
-**GitHub Container Registry (GHCR)**，同时产出 `linux/amd64` 与 `linux/arm64` 双架构。
+**GitHub Container Registry (GHCR)**（`linux/amd64`）。
 
 ```bash
 # 拉取最新镜像（首次）或更新
