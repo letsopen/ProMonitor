@@ -11,7 +11,8 @@ RUN cd agent && go mod download
 COPY server/ ./server/
 COPY agent/ ./agent/
 # CGO_ENABLED=0 生成不依赖 libc 的静态二进制，可直接跑在 alpine/musl 上
-RUN cd server && CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/promonitor-server .
+# 注意：server 的 main 包在 cmd/server 子目录，必须用 ./cmd/server 构建
+RUN cd server && CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/promonitor-server ./cmd/server
 RUN cd agent  && CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/promonitor-agent .
 
 # ========== 2. 前端构建 ==========
