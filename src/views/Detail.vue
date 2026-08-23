@@ -15,6 +15,8 @@ const history = ref<AggRow[]>([])
 const current = ref<ServerView | null>(null)
 const timeRange = ref('24h')
 const serverName = ref(serverId)
+// 主控维护的 ping 节点名（公开端点），用于曲线图例与明细表
+const pingNodeNames = ref<string[]>([])
 
 const chartEls = ['cpu', 'mem', 'disk', 'net', 'ping']
 const charts: Record<string, any> = {}
@@ -25,6 +27,19 @@ const rangeMs: Record<string, number> = {
   '24h': 86_400_000,
   '7d': 7 * 86_400_000,
   '30d': 30 * 86_400_000,
+}
+
+async function loadPingConfig() {
+  try {
+    const res = await fetch('/api/ping-config')
+    if (!res.ok) return
+    const data = await res.json()
+    if (Array.isArray(data.nodes)) {
+      pingNodeNames.value = data.nodes.map((n: any) => n.name || `${n.ip}:${n.port}`)
+    }
+  } catch {
+    /* ignore */
+  }
 }
 
 async function loadHistory() {
@@ -75,21 +90,24 @@ function renderCharts() {
     'KB/s'
   )
 
-  // ping 聚合：每个样本的有效节点 min/avg/max
-  const pingMin: number[] = []
-  const pingAvg: number[] = []
-  const pingMax: number[] = []
-  for (const m of history.value) {
-    const st = pingStats(m.ping_nodes)
-    pingMin.push(st.min ?? 0)
-    pingAvg.push(st.avg ?? 0)
-    pingMax.push(st.max ?? 0)
+  // ping：每个节点一条曲线；无效值（null/-1/>1000）断开不连线
+  const nodeCount = Math.max(0, ...history.value.map((m) => (m.ping_nodes || []).length))
+  const series = []
+  for (let i = 0; i < nodeCount; i++) {
+    const name = pingNodeNames.value[i] || `节点 ${i + 1}`
+    series.push({
+      name,
+      data: history.value.map((m) => {
+        const v = m.ping_nodes?.[i]
+        return v != null && v > 0 && v <= 1000 ? +v.toFixed(1) : null
+      }),
+    })
   }
-  lineChart('ping', 'Ping 延迟 (ms)', times, [
-    { name: '最低', data: pingMin },
-    { name: '平均', data: pingAvg },
-    { name: '最高', data: pingMax },
-  ])
+  if (series.length > 0) {
+    lineChart('ping', 'Ping 延迟 (ms)', times, series, 'ms')
+  } else {
+    lineChart('ping', 'Ping 延迟 (ms)', times, [], 'ms')
+  }
 }
 
 function lineChart(key: string, title: string, times: string[], data: any, unit = '') {
@@ -117,12 +135,13 @@ const latestPings = () => {
   if (history.value.length === 0) return []
   const last = history.value[history.value.length - 1]
   return (last.ping_nodes || []).map((v, i) => ({
-    node: i + 1,
+    node: pingNodeNames.value[i] || `节点 ${i + 1}`,
     ms: v == null || v <= 0 || v > 1000 ? null : +v.toFixed(1),
   }))
 }
 
 onMounted(() => {
+  loadPingConfig()
   loadHistory()
   loadCurrent()
   timer = window.setInterval(loadCurrent, 10000)
