@@ -48,7 +48,22 @@ bin/       预编译静态二进制（linux amd64/arm64，供非 Docker 部署�
 
 ## 快速开始（Docker 部署）
 
-前置：已安装 Docker。两种方式任选其一：**`docker run`（推荐，单命令）** 或 **docker compose**。
+前置：已安装 Docker。三种方式任选其一：**从 GitHub 拉镜像（免构建）**、**`docker run`（推荐，单命令）** 或 **docker compose**。
+
+### 方式 0：直接从 GitHub 拉取镜像（无需本地构建）
+
+项目已配置 GitHub Actions 流水线：push 到 `main` 自动构建并推送镜像到
+**GitHub Container Registry (GHCR)**，同时产出 `linux/amd64` 与 `linux/arm64` 双架构。
+
+```bash
+# 拉取最新镜像（首次）或更新
+docker pull ghcr.io/letsopen/promonitor:latest
+```
+
+> 私有仓库的镜像默认**私有**：如需公开拉取，到 GitHub →
+> 你的头像 → Your packages → `promonitor` → Package settings → Change visibility → Public。
+> 打 `v*` 标签（`git tag v1.0.0 && git push origin v1.0.0`）会额外构建并推送
+> `1.0.0` / `1.0` / `1` 版本镜像。
 
 ### 方式 A：docker run（推荐）
 
