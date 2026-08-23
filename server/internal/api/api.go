@@ -10,6 +10,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"promonitor/server/internal/auth"
+	"promonitor/server/internal/history"
 	"promonitor/server/internal/ingest"
 	"promonitor/server/internal/metrics"
 	"promonitor/server/internal/store"
@@ -20,20 +21,22 @@ type API struct {
 	store    *store.Store
 	auth     *auth.Auth
 	ingest   *ingest.Ingestor
+	history  *history.Handler
 	pingType string // "icmp" | "tcp"，来自环境变量 PING_TYPE
 }
 
-func New(s *store.Store, a *auth.Auth, ing *ingest.Ingestor, pingType string) *API {
-	return &API{store: s, auth: a, ingest: ing, pingType: pingType}
+func New(s *store.Store, a *auth.Auth, ing *ingest.Ingestor, h *history.Handler, pingType string) *API {
+	return &API{store: s, auth: a, ingest: ing, history: h, pingType: pingType}
 }
 
 // Routes 注册全部路由
 func (api *API) Routes(r *chi.Mux) {
-	r.Post("/api/ingest", api.ingest.Handle) // HMAC 验签
-	r.Get("/api/servers", api.listServers)   // 匿名
-	r.Get("/api/servers/latest", api.latest) // 匿名（轮询）
-	r.Get("/api/servers/{id}/metrics", api.history)
-	r.Get("/api/ping-config", api.pingConfig) // 匿名：被控拉取探测配置
+	r.Post("/api/ingest", api.ingest.Handle)   // HMAC 验签：实时数据
+	r.Post("/api/history", api.history.Handle)   // HMAC 验签：10 分钟聚合历史数据
+	r.Get("/api/servers", api.listServers)       // 匿名
+	r.Get("/api/servers/latest", api.latest)     // 匿名（轮询）
+	r.Get("/api/servers/{id}/metrics", api.historyRoute)
+	r.Get("/api/ping-config", api.pingConfig)    // 匿名：被控拉取探测配置
 
 	r.Post("/api/admin/login", api.login)
 	r.Post("/api/admin/logout", api.logout)
@@ -79,7 +82,7 @@ func (api *API) latest(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, m)
 }
 
-func (api *API) history(w http.ResponseWriter, r *http.Request) {
+func (api *API) historyRoute(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	from := parseTime(r.URL.Query().Get("from"), time.Now().Add(-24*time.Hour))
 	to := parseTime(r.URL.Query().Get("to"), time.Now())

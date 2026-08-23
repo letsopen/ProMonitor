@@ -4,69 +4,105 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	gn "github.com/shirou/gopsutil/v4/net"
 	"github.com/shirou/gopsutil/v4/cpu"
 	"github.com/shirou/gopsutil/v4/disk"
 	"github.com/shirou/gopsutil/v4/mem"
+	gn "github.com/shirou/gopsutil/v4/net"
+	_ "modernc.org/sqlite"
 )
 
-// Sample 是上报给主控的单次样本（结构与主控 metrics.Sample 对应）
+// 常量定义
+type envKey string
+
+const (
+	defaultCollectInterval = 30 * time.Second
+	minCollectInterval       = 30 * time.Second
+	windowSize               = 10 * time.Minute
+	configTTL                = 5 * time.Minute
+	maxHistoryRetries        = 5
+	baseBackoff              = 2 * time.Second
+	maxBackoff               = 60 * time.Second
+)
+
+// Sample 是实时上报给主控的单次样本（高频，不落库）。
+// CPU、Mem、Disk 为百分比；NetIn/NetOut 为 KB/s。
 type Sample struct {
-	ServerID string    `json:"server_id"`
-	Name     string    `json:"name"`
-	IP       string    `json:"ip"`
-	TS       int64     `json:"ts"` // unix 秒（测量时间）
-	CPU      float64   `json:"cpu"`
-	Mem      float64   `json:"mem"`
-	Disk     float64   `json:"disk"`
-	NetIn    float64   `json:"net_in"`
-	NetOut   float64   `json:"net_out"`
-	Pings    []float64 `json:"pings"`
+	ServerID  string    `json:"server_id"`
+	Name      string    `json:"name"`
+	IP        string    `json:"ip"`
+	TS        int64     `json:"ts"`
+	CPU       float64   `json:"cpu"`
+	Mem       float64   `json:"mem"`
+	Disk      float64   `json:"disk"`
+	NetIn     float64   `json:"net_in"`
+	NetOut    float64   `json:"net_out"`
+	Pings     []float64 `json:"pings"`
+	CPUCores  int       `json:"cpu_cores"`    // 实时链路新增：CPU 核心数
+	MemTotal  uint64    `json:"mem_total_mb"` // 实时链路新增：内存总大小 MB
+	DiskTotal uint64    `json:"disk_total_gb"`// 实时链路新增：磁盘总大小 GB
+}
+
+// AggRow 是 10 分钟窗口聚合后的单条记录，对应服务端 metrics_agg 表。
+type AggRow struct {
+	TS    int64     `json:"ts"`
+	CPU   float64   `json:"cpu_avg"`
+	Mem   float64   `json:"mem_avg"`
+	Disk  float64   `json:"disk_avg"`
+	NetIn float64   `json:"net_in_avg"`
+	NetOut float64  `json:"net_out_avg"`
+	Pings []float64 `json:"ping_nodes"`
+}
+
+// HistoryPayload 是被控批量上报给主控 /api/history 的负载。
+type HistoryPayload struct {
+	ServerID string   `json:"server_id"`
+	Name     string   `json:"name"`
+	IP       string   `json:"ip"`
+	Rows     []AggRow `json:"rows"`
 }
 
 // PingNode 是主控统一下发的探测节点
 type PingNode struct {
 	ID   int64  `json:"id"`
 	Name string `json:"name"`
-	IP   string `json:"ip"`   // 仅 IPv4
-	Port int    `json:"port"` // TCP 探测端口
+	IP   string `json:"ip"`
+	Port int    `json:"port"`
 }
 
 // PingConfig 是主控下发的网络探测配置
 type PingConfig struct {
-	Type  string     `json:"type"` // "icmp" | "tcp"
+	Type  string     `json:"type"`
 	Nodes []PingNode `json:"nodes"`
 }
 
 // AgentConfig 是被控运行参数
 type AgentConfig struct {
-	Master string
-	Secret string
-	SID    string
-	Name   string
-	IP     string
+	Master          string
+	Secret          string
+	SID             string
+	Name            string
+	IP              string
+	CollectInterval time.Duration
 }
 
-const (
-	maxQueue   = 500   // 积压队列上限，超限丢最旧，避免 OOM
-	maxRetries = 5     // 单条样本最大重试次数
-	baseBackoff = 2 * time.Second
-	maxBackoff  = 60 * time.Second
-	configTTL  = 5 * time.Minute // 多久重新拉取一次探测配置
-)
-
+// 全局变量
 var (
 	prevNet gn.IOCountersStat
 	prevTS  time.Time
@@ -80,31 +116,40 @@ func env(k, def string) string {
 	return def
 }
 
+func parseCollectInterval(s string) time.Duration {
+	if s == "" {
+		return defaultCollectInterval
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 30 || n%30 != 0 {
+		log.Printf("warn: COLLECT_INTERVAL invalid (%q), fallback to 30s", s)
+		return defaultCollectInterval
+	}
+	return time.Duration(n) * time.Second
+}
+
 func measureTCPPing(host string, port int, timeout time.Duration) float64 {
 	addr := net.JoinHostPort(host, itoa(port))
 	start := time.Now()
 	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
-		return -1 // 无效（含超时）
+		return -1
 	}
 	conn.Close()
 	return float64(time.Since(start).Milliseconds())
 }
 
 // measureICMPPing 用 raw socket 做 ICMP echo，需要容器具备 CAP_NET_RAW（--cap-add NET_RAW）或特权模式。
-// 否则会失败，调用方应回退到 -1。
 func measureICMPPing(host string, timeout time.Duration) float64 {
-	// 使用 net 包建立 ICMP（ip4:icmp）连接；非特权环境会失败
 	c, err := net.DialTimeout("ip4:icmp", host, timeout)
 	if err != nil {
 		return -1
 	}
 	defer c.Close()
-	// 构造最小 ICMP echo 请求（type=8, code=0, id, seq, 校验和=0 简化）
 	id := uint16(os.Getpid() & 0xffff)
 	seq := uint16(1)
 	msg := make([]byte, 8)
-	msg[0] = 8 // Echo Request
+	msg[0] = 8
 	msg[1] = 0
 	msg[2] = 0
 	msg[3] = 0
@@ -147,118 +192,239 @@ func itoa(n int) string {
 	return string(b[i:])
 }
 
-// Sender 持有一个带重试的积压队列：采集结果先入队，后台顺序出队上传。
-type Sender struct {
+// RealtimeSender 负责实时样本的上报（失败不重试）。
+type RealtimeSender struct {
 	cfg    AgentConfig
 	client *http.Client
-	queue  []*Sample
-	mu     sync.Mutex
-	cond   *sync.Cond
-	stop   chan struct{}
 }
 
-func NewSender(cfg AgentConfig) *Sender {
-	s := &Sender{
-		cfg:    cfg,
-		client: &http.Client{Timeout: 10 * time.Second},
-		stop:   make(chan struct{}),
-	}
-	s.cond = sync.NewCond(&s.mu)
-	go s.loop()
-	return s
+func NewRealtimeSender(cfg AgentConfig) *RealtimeSender {
+	return &RealtimeSender{cfg: cfg, client: &http.Client{Timeout: 10 * time.Second}}
 }
 
-// Enqueue 把样本放入积压队列（非阻塞，仅在队列满时丢弃最旧）
-func (s *Sender) Enqueue(smpl *Sample) {
-	s.mu.Lock()
-	if len(s.queue) >= maxQueue {
-		// 丢弃最旧的一条，腾出空间
-		s.queue = s.queue[1:]
-	}
-	s.queue = append(s.queue, smpl)
-	s.cond.Signal()
-	s.mu.Unlock()
-}
-
-// loop 后台 goroutine：顺序取出样本，上传失败按指数退避重试
-func (s *Sender) loop() {
-	for {
-		s.mu.Lock()
-		for len(s.queue) == 0 {
-			select {
-			case <-s.stop:
-				s.mu.Unlock()
-				return
-			default:
-			}
-			s.cond.Wait()
-			select {
-			case <-s.stop:
-				s.mu.Unlock()
-				return
-			default:
-			}
-		}
-		smpl := s.queue[0]
-		s.mu.Unlock()
-
-		if s.sendWithRetry(smpl) {
-			s.mu.Lock()
-			// 仅当仍是最前面那条时才出队（防止并发下错位）
-			if len(s.queue) > 0 && s.queue[0] == smpl {
-				s.queue = s.queue[1:]
-			}
-			s.mu.Unlock()
-		}
-		// 失败则保留在队首，进入退避后重试（在 sendWithRetry 内已实现退避）
-	}
-}
-
-// sendWithRetry 上传单条样本，失败指数退避重试，成功返回 true
-func (s *Sender) sendWithRetry(smpl *Sample) bool {
-	body, err := json.Marshal(smpl)
-	if err != nil {
-		return true // 序列化失败无法恢复，直接丢弃
-	}
+func (s *RealtimeSender) Send(smpl *Sample) {
+	body, _ := json.Marshal(smpl)
 	mac := hmac.New(sha256.New, []byte(s.cfg.Secret))
 	mac.Write(body)
 	sig := hex.EncodeToString(mac.Sum(nil))
-
 	url := strings.TrimRight(s.cfg.Master, "/") + "/api/ingest"
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		req, err := http.NewRequest("POST", url, bytes.NewReader(body))
-		if err != nil {
-			log.Printf("build request error: %v", err)
-			return true
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Signature", sig)
-
-		resp, err := s.client.Do(req)
-		if err != nil {
-			log.Printf("send error (attempt %d/%d): %v", attempt+1, maxRetries, err)
-		} else {
-			resp.Body.Close()
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				return true
-			}
-			log.Printf("send rejected (attempt %d/%d): status %d", attempt+1, maxRetries, resp.StatusCode)
-		}
-		// 退避（最后一步不再 sleep）
-		if attempt < maxRetries-1 {
-			backoff := baseBackoff * time.Duration(1<<uint(attempt))
-			if backoff > maxBackoff {
-				backoff = maxBackoff
-			}
-			time.Sleep(backoff)
-		}
+	req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Signature", sig)
+	resp, err := s.client.Do(req)
+	if err != nil {
+		log.Printf("realtime send error ts=%d: %v", smpl.TS, err)
+		return
 	}
-	log.Printf("give up sample ts=%d after %d attempts (dropped)", smpl.TS, maxRetries)
-	return true // 达到最大重试后丢弃，避免永久阻塞队列
+	resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("realtime send rejected ts=%d: status %d", smpl.TS, resp.StatusCode)
+	}
 }
 
-func (s *Sender) Stop() {
-	close(s.stop)
+// HistoryManager 负责本地 10 分钟窗口聚合、持久化与重试上传。
+type HistoryManager struct {
+	cfg    AgentConfig
+	client *http.Client
+	store  *HistoryStore
+	mu     sync.Mutex
+	n      int
+	cpuSum float64
+	memSum float64
+	diskSum float64
+	netInSum float64
+	netOutSum float64
+	pingSum  []float64
+	pingCnt  []int
+	name     string
+	ip       string
+}
+
+func NewHistoryManager(cfg AgentConfig, store *HistoryStore, pingN int) *HistoryManager {
+	return &HistoryManager{
+		cfg:     cfg,
+		client:  &http.Client{Timeout: 10 * time.Second},
+		store:   store,
+		pingSum: make([]float64, pingN),
+		pingCnt: make([]int, pingN),
+	}
+}
+
+// Add 把一次实时样本累加到当前 10 分钟窗口。
+func (h *HistoryManager) Add(smpl *Sample) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.n++
+	h.cpuSum += smpl.CPU
+	h.memSum += smpl.Mem
+	h.diskSum += smpl.Disk
+	h.netInSum += smpl.NetIn
+	h.netOutSum += smpl.NetOut
+	h.name = smpl.Name
+	h.ip = smpl.IP
+	for i := 0; i < len(h.pingSum) && i < len(smpl.Pings); i++ {
+		v := smpl.Pings[i]
+		if v >= 0 && v <= 1000 {
+			h.pingSum[i] += v
+			h.pingCnt[i]++
+		}
+	}
+}
+
+// Flush 结算当前窗口，生成 AggRow，清空窗口，并持久化到本地待上传表。
+// ts 应为当前整数 10 分钟边界。
+func (h *HistoryManager) Flush(ts int64) *AggRow {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.n == 0 {
+		return nil
+	}
+	row := AggRow{
+		TS:     ts,
+		CPU:    h.cpuSum / float64(h.n),
+		Mem:    h.memSum / float64(h.n),
+		Disk:   h.diskSum / float64(h.n),
+		NetIn:  h.netInSum / float64(h.n),
+		NetOut: h.netOutSum / float64(h.n),
+		Pings:  make([]float64, len(h.pingSum)),
+	}
+	for i := range row.Pings {
+		if h.pingCnt[i] > 0 {
+			row.Pings[i] = h.pingSum[i] / float64(h.pingCnt[i])
+		} else {
+			row.Pings[i] = -1
+		}
+	}
+	// 重置窗口
+	h.n = 0
+	h.cpuSum, h.memSum, h.diskSum, h.netInSum, h.netOutSum = 0, 0, 0, 0, 0
+	h.pingSum = make([]float64, len(h.pingSum))
+	h.pingCnt = make([]int, len(h.pingCnt))
+	return &row
+}
+
+// UploadHistory 批量上传聚合记录到主控 /api/history，返回是否成功。
+func (h *HistoryManager) UploadHistory(rows []AggRow) bool {
+	if len(rows) == 0 {
+		return true
+	}
+	payload := HistoryPayload{
+		ServerID: h.cfg.SID,
+		Name:     h.cfg.Name,
+		IP:       h.cfg.IP,
+		Rows:     rows,
+	}
+	body, _ := json.Marshal(payload)
+	mac := hmac.New(sha256.New, []byte(h.cfg.Secret))
+	mac.Write(body)
+	sig := hex.EncodeToString(mac.Sum(nil))
+	url := strings.TrimRight(h.cfg.Master, "/") + "/api/history"
+	req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Signature", sig)
+	resp, err := h.client.Do(req)
+	if err != nil {
+		log.Printf("history upload error: %v", err)
+		return false
+	}
+	resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("history upload rejected: status %d", resp.StatusCode)
+		return false
+	}
+	return true
+}
+
+// HistoryStore 是 agent 本地 SQLite，用于持久化待上传的历史聚合记录。
+type HistoryStore struct {
+	db *sql.DB
+}
+
+// OpenHistoryStore 打开本地数据库。
+func OpenHistoryStore(path string) (*HistoryStore, error) {
+	if path == "" {
+		path = "agent.db"
+	}
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, err
+		}
+	}
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)", path)
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	if err := db.Ping(); err != nil {
+		return nil, err
+	}
+	schema := `
+CREATE TABLE IF NOT EXISTS pending_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    server_id   TEXT NOT NULL,
+    ts          INTEGER NOT NULL,
+    payload     TEXT NOT NULL,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pending_history_ts ON pending_history(server_id, ts ASC);
+`
+	if _, err := db.Exec(schema); err != nil {
+		return nil, err
+	}
+	return &HistoryStore{db: db}, nil
+}
+
+func (s *HistoryStore) Close() error { return s.db.Close() }
+
+// SavePending 把一条聚合记录序列化后存入本地。
+func (s *HistoryStore) SavePending(serverID string, row AggRow) error {
+	payload, _ := json.Marshal(row)
+	_, err := s.db.Exec(
+		`INSERT INTO pending_history(server_id, ts, payload, created_at) VALUES(?,?,?,?)`,
+		serverID, row.TS, string(payload), time.Now().Unix())
+	return err
+}
+
+// ListPending 读取所有待上传记录。
+func (s *HistoryStore) ListPending(serverID string) ([]PendingHistory, error) {
+	rows, err := s.db.Query(
+		`SELECT id, ts, payload, attempts FROM pending_history WHERE server_id=? ORDER BY ts ASC`,
+		serverID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PendingHistory
+	for rows.Next() {
+		var p PendingHistory
+		if err := rows.Scan(&p.ID, &p.TS, &p.Payload, &p.Attempts); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// DeletePending 删除已上传记录。
+func (s *HistoryStore) DeletePending(id int64) error {
+	_, err := s.db.Exec(`DELETE FROM pending_history WHERE id=?`, id)
+	return err
+}
+
+// IncrementAttempts 增加重试次数。
+func (s *HistoryStore) IncrementAttempts(id int64) error {
+	_, err := s.db.Exec(`UPDATE pending_history SET attempts = attempts + 1 WHERE id=?`, id)
+	return err
+}
+
+// PendingHistory 是本地待上传记录的表结构。
+type PendingHistory struct {
+	ID       int64
+	TS       int64
+	Payload  string
+	Attempts int
 }
 
 // fetchPingConfig 从主控拉取探测配置
@@ -270,7 +436,7 @@ func fetchPingConfig(master string) (PingConfig, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return pc, errHTTPStatus(resp.StatusCode)
+		return pc, fmt.Errorf("unexpected status %d", resp.StatusCode)
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&pc); err != nil {
 		return pc, err
@@ -278,13 +444,7 @@ func fetchPingConfig(master string) (PingConfig, error) {
 	return pc, nil
 }
 
-type errHTTPStatus int
-
-func (e errHTTPStatus) Error() string { return "unexpected status " + itoa(int(e)) }
-
-func collect(cfg AgentConfig, pc PingConfig) *Sample {
-	now := time.Now()
-
+func collect(cfg AgentConfig, pc PingConfig, now time.Time) *Sample {
 	cpuPct, _ := cpu.Percent(0, false)
 	var cpuVal float64
 	if len(cpuPct) > 0 {
@@ -292,15 +452,19 @@ func collect(cfg AgentConfig, pc PingConfig) *Sample {
 	}
 
 	vm, _ := mem.VirtualMemory()
-	memVal := 0.0
+	var memVal float64
+	var memTotal uint64
 	if vm != nil {
 		memVal = vm.UsedPercent
+		memTotal = vm.Total / 1024 / 1024 // MB
 	}
 
 	du, _ := disk.Usage("/")
-	diskVal := 0.0
+	var diskVal float64
+	var diskTotal uint64
 	if du != nil {
 		diskVal = du.UsedPercent
+		diskTotal = du.Total / 1024 / 1024 / 1024 // GB
 	}
 
 	var netIn, netOut float64
@@ -309,8 +473,8 @@ func collect(cfg AgentConfig, pc PingConfig) *Sample {
 		if haveP && !prevTS.IsZero() {
 			dt := now.Sub(prevTS).Seconds()
 			if dt > 0 {
-				netIn = float64(c.BytesRecv-prevNet.BytesRecv) / dt
-				netOut = float64(c.BytesSent-prevNet.BytesSent) / dt
+				netIn = float64(c.BytesRecv-prevNet.BytesRecv) / dt / 1024   // KB/s
+				netOut = float64(c.BytesSent-prevNet.BytesSent) / dt / 1024  // KB/s
 			}
 		}
 		prevNet = c
@@ -323,22 +487,25 @@ func collect(cfg AgentConfig, pc PingConfig) *Sample {
 		switch pc.Type {
 		case "icmp":
 			pings[i] = measureICMPPing(n.IP, 1*time.Second)
-		default: // tcp：使用节点自身配置的端口
+		default:
 			pings[i] = measureTCPPing(n.IP, n.Port, 1*time.Second)
 		}
 	}
 
 	return &Sample{
-		ServerID: cfg.SID,
-		Name:     cfg.Name,
-		IP:       cfg.IP,
-		TS:       now.Unix(), // 测量时间，unix 秒
-		CPU:      cpuVal,
-		Mem:      memVal,
-		Disk:     diskVal,
-		NetIn:    netIn,
-		NetOut:   netOut,
-		Pings:    pings,
+		ServerID:  cfg.SID,
+		Name:      cfg.Name,
+		IP:        cfg.IP,
+		TS:        now.Unix(),
+		CPU:       cpuVal,
+		Mem:       memVal,
+		Disk:      diskVal,
+		NetIn:     netIn,
+		NetOut:    netOut,
+		Pings:     pings,
+		CPUCores:  runtime.NumCPU(),
+		MemTotal:  memTotal,
+		DiskTotal: diskTotal,
 	}
 }
 
@@ -348,9 +515,7 @@ func main() {
 	sid := flag.String("id", env("SERVER_ID", ""), "被控唯一ID")
 	name := flag.String("name", env("SERVER_NAME", ""), "展示名(默认同ID)")
 	ip := flag.String("ip", env("SERVER_IP", ""), "被控IP")
-	// -targets 仅作为可选覆盖：若设置则忽略主控下发的节点
-	targets := flag.String("targets", env("PING_TARGETS", ""), "可选：逗号分隔节点，覆盖主控下发")
-	interval := flag.Duration("interval", 30*time.Second, "采集间隔")
+	interval := flag.Duration("interval", parseCollectInterval(os.Getenv("COLLECT_INTERVAL")), "采集间隔")
 	flag.Parse()
 
 	if *secret == "" {
@@ -362,77 +527,118 @@ func main() {
 	if *name == "" {
 		*name = *sid
 	}
-
-	cfg := AgentConfig{Master: *master, Secret: *secret, SID: *sid, Name: *name, IP: *ip}
-
-	// 本地回退节点：把逗号分隔的 host 转成 PingNode（TCP 用默认端口 80）
-	localNodes := func() []PingNode {
-		var out []PingNode
-		for _, h := range splitTargets(*targets, 50) {
-			out = append(out, PingNode{Name: h, IP: h, Port: 80})
-		}
-		return out
+	if *interval < minCollectInterval || int(interval.Seconds())%30 != 0 {
+		log.Printf("warn: interval %v invalid, fallback to 30s", *interval)
+		*interval = defaultCollectInterval
 	}
 
-	// 初始拉取探测配置；失败则用本地覆盖或空节点
+	cfg := AgentConfig{Master: *master, Secret: *secret, SID: *sid, Name: *name, IP: *ip, CollectInterval: *interval}
+
 	pc := PingConfig{Type: "tcp"}
-	npc, err := fetchPingConfig(*master)
-	if err != nil {
-		log.Printf("warn: fetch ping-config failed (%v); fallback to local targets", err)
-		pc.Nodes = localNodes()
-	} else {
-		log.Printf("ping-config: type=%s nodes=%d", npc.Type, len(npc.Nodes))
-		if len(npc.Nodes) == 0 && *targets != "" {
-			npc.Nodes = localNodes()
-		}
+	if npc, err := fetchPingConfig(*master); err == nil {
 		pc = npc
+		log.Printf("ping-config: type=%s nodes=%d", pc.Type, len(pc.Nodes))
+	} else {
+		log.Printf("warn: fetch ping-config failed (%v); use tcp empty nodes", err)
 	}
 
-	sender := NewSender(cfg)
-	defer sender.Stop()
+	store, err := OpenHistoryStore(env("DB_PATH", "agent.db"))
+	if err != nil {
+		log.Fatalf("open local store failed: %v", err)
+	}
+	defer store.Close()
 
-	// 配置快照用 atomic.Value 承载，供采集循环无锁读取、刷新 goroutine 安全更新
+	rtSender := NewRealtimeSender(cfg)
+	histMgr := NewHistoryManager(cfg, store, len(pc.Nodes))
+
 	var cfgStore atomic.Value
 	cfgStore.Store(pc)
 
-	// 周期性重新拉取配置（热更新），并刷新探测节点
 	go func() {
 		t := time.NewTicker(configTTL)
 		defer t.Stop()
 		for range t.C {
 			if npc, err := fetchPingConfig(*master); err == nil {
-				if len(npc.Nodes) == 0 && *targets != "" {
-					npc.Nodes = localNodes()
-				}
 				cfgStore.Store(npc)
 				log.Printf("ping-config refreshed: type=%s nodes=%d", npc.Type, len(npc.Nodes))
 			}
 		}
 	}()
 
-	ticker := time.NewTicker(*interval)
-	collectAndSend := func() {
-		sender.Enqueue(collect(cfg, cfgStore.Load().(PingConfig)))
-	}
-	collectAndSend()
-	for range ticker.C {
-		collectAndSend()
-	}
+	// 历史数据重传后台循环
+	go func() {
+		for {
+			histMgr.retryPending()
+			time.Sleep(30 * time.Second)
+		}
+	}()
+
+	// 10 分钟窗口聚合调度：对齐到整数 10 分钟边界
+	go func() {
+		var lastBucket int64 = -1
+		t := time.NewTicker(cfg.CollectInterval)
+		defer t.Stop()
+		for now := range t.C {
+			smpl := collect(cfg, cfgStore.Load().(PingConfig), now)
+			histMgr.Add(smpl)
+			go rtSender.Send(smpl)
+
+			// 检查是否跨越整数 10 分钟边界
+			currentBucket := now.Truncate(windowSize).Unix()
+			if lastBucket != -1 && currentBucket != lastBucket {
+				if row := histMgr.Flush(lastBucket); row != nil {
+					if err := store.SavePending(cfg.SID, *row); err != nil {
+						log.Printf("save pending history failed: %v", err)
+					}
+				}
+			}
+			lastBucket = currentBucket
+		}
+	}()
+
+	// 初始采集一次
+	smpl := collect(cfg, pc, time.Now())
+	histMgr.Add(smpl)
+	go rtSender.Send(smpl)
+
+	select {}
 }
 
-func splitTargets(s string, max int) []string {
-	if s == "" {
-		return nil
+// retryPending 尝试上传本地积压的历史聚合记录（按 ts 升序批量）。
+func (h *HistoryManager) retryPending() {
+	pending, err := h.store.ListPending(h.cfg.SID)
+	if err != nil {
+		log.Printf("list pending history failed: %v", err)
+		return
 	}
-	parts := strings.Split(s, ",")
-	if len(parts) > max {
-		parts = parts[:max]
-	}
-	var out []string
-	for _, p := range parts {
-		if p = strings.TrimSpace(p); p != "" {
-			out = append(out, p)
+	batchSize := 50
+	for i := 0; i < len(pending); i += batchSize {
+		end := i + batchSize
+		if end > len(pending) {
+			end = len(pending)
+		}
+		var rows []AggRow
+		var ids []int64
+		for _, p := range pending[i:end] {
+			var row AggRow
+			if err := json.Unmarshal([]byte(p.Payload), &row); err != nil {
+				_ = h.store.DeletePending(p.ID)
+				continue
+			}
+			rows = append(rows, row)
+			ids = append(ids, p.ID)
+		}
+		if len(rows) == 0 {
+			continue
+		}
+		if h.UploadHistory(rows) {
+			for _, id := range ids {
+				_ = h.store.DeletePending(id)
+			}
+		} else {
+			for _, id := range ids {
+				_ = h.store.IncrementAttempts(id)
+			}
 		}
 	}
-	return out
 }

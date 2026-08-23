@@ -2,7 +2,7 @@
 
 ## 技术栈（v4 自托管 · Docker / Alpine 部署）
 - **主控后端**: Go（CGO_ENABLED=0 静态二进制），监听 `:9000`，同时托管前端 `dist/`
-- **被控 Agent**: Go 单二进制，零运行时依赖，每 30s 上报
+- **被控 Agent**: Go 单二进制，零运行时依赖，按 `COLLECT_INTERVAL`（默认 30s）上报实时数据
 - **前端**: Vue3 + Vite + Element Plus（单页应用）
 - **数据库**: SQLite（单文件 `promonitor.db`，WAL 模式，纯 Go 驱动 modernc，无 cgo）
 - **部署**: Docker，运行期基础镜像 **Alpine 3.21**；构建期 `golang:1.23-alpine`
@@ -30,21 +30,33 @@ Dockerfile / docker-compose.yml / .dockerignore   容器化部署
 
 ## 架构与数据流
 ```
-被控Agent(Go) --HMAC签名 POST--> 主控 /api/ingest --按测量时间聚合--> SQLite(metrics_agg)
-        |                                              |                          |
-        |--GET /api/ping-config(每5分钟)--> 探测配置     latest_snapshot   30天保留(DELETE+VACUUM)
-        |   (主控统一管理 PING_TYPE + SQLite ping_nodes 表)                       |
+被控Agent(Go)
+        │  每 COLLECT_INTERVAL 秒采集
+        │  POST /api/ingest -> 主控刷新 latest_snapshot（实时，不落历史）
+        │  本地 10 分钟窗口聚合 -> POST /api/history -> 主控落库 metrics_agg
+        │  GET /api/ping-config(每5分钟) -> 探测配置
+        
+主控 Server
+        ├─ /api/ingest  刷新 latest_snapshot
+        ├─ /api/history 写入 metrics_agg
+        └─ REST API + 托管 dist/
+            │
+            
+SQLite (promonitor.db) + Vue 前端轮询
+
 Vue前端 <--GET /api/servers(轮询10s)-- 读取最新快照(latest_snapshot JOIN)
 Vue前端 <--GET /api/servers/:id/metrics-- 读取30天聚合历史
 ```
 
 ## 关键设计决策
-- **高频原始数据不落库**：`/api/ingest` 仅验签 + 写入进程内内存聚合缓冲；每 10 分钟结算 1 行均值落库。
-- **数据时间 = 被控测量时间**：样本 `ts` 为测量时间（unix 秒），聚合按 `floor(ts/600)*600` 对齐到 10 分钟桶，落库 `ts` 即桶起点。网络故障积压的数据补传后落在真实时间点，不污染恢复时刻的曲线。
+- **实时/历史双通道分离**：
+  - 实时：`/api/ingest` 仅刷新 `latest_snapshot`，不落历史库，失败不重试。
+  - 历史：被控本地做 10 分钟窗口聚合，在整数 10 分钟边界（0/10/20/... 分）通过 `/api/history` 批量上报；失败本地持久化，自动重试。
+- **数据时间 = 被控测量时间**：样本 `ts` 为测量时间（unix 秒），历史聚合按 `floor(ts/600)*600` 对齐到 10 分钟桶，落库 `ts` 即桶起点。网络故障积压的数据补传后落在真实时间点，不污染恢复时刻的曲线。
 - **ping 节点主控统一下发**：`GET /api/ping-config`（匿名）返回 `{type, nodes}`；节点清单存在 SQLite `ping_nodes` 表，由管理后台 `GET/POST/PUT/DELETE /api/admin/ping-nodes` 维护；被控启动拉取 + 每 5 分钟热更新；`-targets` 仅作主控未配置节点时的回退。
-- **被控积压重试**：Agent 内存队列（上限 500）+ 指数退避重试（2s→60s，最多 5 次），失败不丢数据，恢复自动续传。
+- **被控历史数据可靠性**：Agent 本地 SQLite 持久化待上传记录，后台按批量（50 条/次）+ 指数退避重试，成功后删除；恢复后自动续传。
 - **缓存 = 纯进程内内存**，无 Redis（资源敏感、单实例）。
-- **首次上报即注册**：聚合器在窗口首次出现该 server 时异步 `UpsertServer`，被控无需先在管理页添加。
+- **首次上报即注册**：`/api/ingest` 处理时异步 `UpsertServer`，被控无需先在管理页添加。
 - **30 天保留**：SQLite 不做分区，应用层每日 `PruneOld(30)` 删除过期行并 `VACUUM`。
 - **ping 无效判定**：延迟 >1000ms 不计入均值（哨兵值 -1）。
 - **鉴权**：单 admin，密码 bcrypt + httpOnly Cookie 签名会话；列表/详情匿名，管理页 `RequireAdmin` 中间件服务端拦截。
@@ -104,6 +116,10 @@ docker compose up -d --build
 
 ## 被控 Agent 启动参数
 `-master MASTER_URL` / `-secret HMAC_SECRET`(必填) / `-id SERVER_ID`(必填) / `-name` / `-ip` / `-targets`(可选覆盖) / `-interval`(默认30s)
-对应环境变量：MASTER_URL / HMAC_SECRET / SERVER_ID / SERVER_NAME / SERVER_IP / PING_TARGETS。
+对应环境变量：
+- `MASTER_URL` / `HMAC_SECRET` / `SERVER_ID` / `SERVER_NAME` / `SERVER_IP`
+- `PING_TARGETS`：可选回退节点
+- `COLLECT_INTERVAL`：实时采集间隔（秒），默认 30，最低 30，必须是 30 的倍数
+
 延迟节点与方法由主控统一下发（Agent 拉取 `/api/ping-config`，每 5 分钟热更新）；`-targets` 仅当主控未配置节点时回退使用。
-Agent 内置内存积压队列 + 指数退避重试，网络故障期间数据暂存、恢复后自动续传。
+Agent 本地做 10 分钟窗口聚合，并通过 `/api/history` 上报；失败本地持久化 + 自动重试。

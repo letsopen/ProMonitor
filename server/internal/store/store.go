@@ -51,6 +51,9 @@ CREATE TABLE IF NOT EXISTS latest_snapshot (
     disk        REAL,
     net_in      REAL,
     net_out     REAL,
+    cpu_cores   INTEGER,
+    mem_total   INTEGER,
+    disk_total  INTEGER,
     pings       TEXT,
     updated_at  INTEGER NOT NULL
 );
@@ -174,22 +177,44 @@ func (s *Store) InsertAgg(ctx context.Context, a metrics.AggRow) error {
 	return err
 }
 
+// UpsertAggBatch 批量写入或覆盖 10 分钟聚合行（被控按整数边界聚合后上报）。
+// 使用 INSERT OR REPLACE，方便被控重传时幂等更新。
+func (s *Store) UpsertAggBatch(ctx context.Context, serverID string, rows []metrics.AggRow) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, a := range rows {
+		pings, _ := json.Marshal(a.Pings)
+		if _, err := tx.ExecContext(ctx,
+			`INSERT OR REPLACE INTO metrics_agg(server_id, ts, cpu_avg, mem_avg, disk_avg, net_in_avg, net_out_avg, ping_nodes)
+			 VALUES(?,?,?,?,?,?,?,?)`,
+			serverID, a.TS, a.CPU, a.Mem, a.Disk, a.NetIn, a.NetOut, string(pings)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (s *Store) UpdateSnapshot(ctx context.Context, a metrics.AggRow) error {
 	pings, _ := json.Marshal(a.Pings)
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO latest_snapshot(server_id, cpu, mem, disk, net_in, net_out, pings, updated_at)
-		 VALUES(?,?,?,?,?,?,?,?)
+		`INSERT INTO latest_snapshot(server_id, cpu, mem, disk, net_in, net_out, cpu_cores, mem_total, disk_total, pings, updated_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?)
 		 ON CONFLICT(server_id) DO UPDATE SET
 		   cpu=excluded.cpu, mem=excluded.mem, disk=excluded.disk,
-		   net_in=excluded.net_in, net_out=excluded.net_out, pings=excluded.pings,
-		   updated_at=excluded.updated_at`,
-		a.ServerID, a.CPU, a.Mem, a.Disk, a.NetIn, a.NetOut, string(pings), time.Now().Unix())
+		   net_in=excluded.net_in, net_out=excluded.net_out,
+		   cpu_cores=excluded.cpu_cores, mem_total=excluded.mem_total, disk_total=excluded.disk_total,
+		   pings=excluded.pings, updated_at=excluded.updated_at`,
+		a.ServerID, a.CPU, a.Mem, a.Disk, a.NetIn, a.NetOut, a.CPUCores, a.MemTotal, a.DiskTotal, string(pings), time.Now().Unix())
 	return err
 }
 
 func (s *Store) ListServers(ctx context.Context) ([]metrics.ServerView, error) {
 	q := `SELECT s.id, s.name, s.ip, s.status,
-				 sn.cpu, sn.mem, sn.disk, sn.net_in, sn.net_out, sn.pings, sn.updated_at
+				 sn.cpu, sn.mem, sn.disk, sn.net_in, sn.net_out,
+				 sn.cpu_cores, sn.mem_total, sn.disk_total, sn.pings, sn.updated_at
 		  FROM servers s
 		  LEFT JOIN latest_snapshot sn ON sn.server_id = s.id
 		  ORDER BY s.created_at DESC`
@@ -204,8 +229,11 @@ func (s *Store) ListServers(ctx context.Context) ([]metrics.ServerView, error) {
 		var pings []byte
 		var updatedAt sql.NullInt64
 		var cpu, mem, disk, netIn, netOut sql.NullFloat64
+		var cpuCores sql.NullInt64
+		var memTotal, diskTotal sql.NullInt64
 		if err := rows.Scan(&v.ID, &v.Name, &v.IP, &v.Status,
-			&cpu, &mem, &disk, &netIn, &netOut, &pings, &updatedAt); err != nil {
+			&cpu, &mem, &disk, &netIn, &netOut,
+			&cpuCores, &memTotal, &diskTotal, &pings, &updatedAt); err != nil {
 			return nil, err
 		}
 		if cpu.Valid {
@@ -222,6 +250,18 @@ func (s *Store) ListServers(ctx context.Context) ([]metrics.ServerView, error) {
 		}
 		if netOut.Valid {
 			v.NetOut = &netOut.Float64
+		}
+		if cpuCores.Valid {
+			cores := int(cpuCores.Int64)
+			v.CPUCores = &cores
+		}
+		if memTotal.Valid {
+			mt := uint64(memTotal.Int64)
+			v.MemTotal = &mt
+		}
+		if diskTotal.Valid {
+			dt := uint64(diskTotal.Int64)
+			v.DiskTotal = &dt
 		}
 		if len(pings) > 0 {
 			_ = json.Unmarshal(pings, &v.Pings)

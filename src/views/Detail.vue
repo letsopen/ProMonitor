@@ -166,6 +166,9 @@ watch(timeRange, loadHistory)
         <div class="card"><div class="k">入站</div><div class="v">{{ formatNet(current.net_in) }}</div></div>
         <div class="card"><div class="k">出站</div><div class="v">{{ formatNet(current.net_out) }}</div></div>
         <div class="card"><div class="k">Ping 均延迟</div><div class="v">{{ pingStats(current.pings).avg != null ? pingStats(current.pings).avg!.toFixed(0) + ' ms' : '-' }}</div></div>
+        <div class="card"><div class="k">CPU 核心</div><div class="v">{{ current.cpu_cores != null ? current.cpu_cores + ' 核' : '-' }}</div></div>
+        <div class="card"><div class="k">内存容量</div><div class="v">{{ current.mem_total_mb != null ? (current.mem_total_mb / 1024).toFixed(1) + ' GB' : '-' }}</div></div>
+        <div class="card"><div class="k">磁盘容量</div><div class="v">{{ current.disk_total_gb != null ? current.disk_total_gb + ' GB' : '-' }}</div></div>
       </div>
 
       <!-- 历史曲线 -->

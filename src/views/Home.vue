@@ -80,6 +80,15 @@ onUnmounted(() => {
             <span class="net">{{ formatNet(row.net_in) }} / {{ formatNet(row.net_out) }}</span>
           </template>
         </el-table-column>
+        <el-table-column label="硬件" min-width="160">
+          <template #default="{ row }">
+            <span class="hardware">
+              {{ row.cpu_cores != null ? row.cpu_cores + 'C' : '-' }} /
+              {{ row.mem_total_mb != null ? (row.mem_total_mb / 1024).toFixed(1) + 'G' : '-' }} /
+              {{ row.disk_total_gb != null ? row.disk_total_gb + 'G' : '-' }}
+            </span>
+          </template>
+        </el-table-column>
         <el-table-column label="Ping 均延迟" width="120">
           <template #default="{ row }">
             <span :class="pingStats(row.pings).avg != null && pingStats(row.pings).avg! > 300 ? 'warn' : ''">
@@ -133,6 +142,10 @@ onUnmounted(() => {
   text-decoration: underline;
 }
 .net {
+  font-size: 13px;
+  color: #606266;
+}
+.hardware {
   font-size: 13px;
   color: #606266;
 }

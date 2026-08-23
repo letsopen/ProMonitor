@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -8,18 +9,19 @@ import (
 	"io/ioutil"
 	"net/http"
 
-	"promonitor/server/internal/aggregator"
 	"promonitor/server/internal/metrics"
+	"promonitor/server/internal/store"
 )
 
-// Ingestor 处理被控上报：HMAC 验签 + 写入聚合缓冲（不持久化原始数据）
+// Ingestor 处理被控实时上报：HMAC 验签 + 刷新 latest_snapshot（不持久化原始数据）。
+// 10 分钟历史聚合已下沉到被控端完成，通过 /api/history 上报。
 type Ingestor struct {
-	agg    *aggregator.Aggregator
+	store  *store.Store
 	secret string
 }
 
-func New(agg *aggregator.Aggregator, secret string) *Ingestor {
-	return &Ingestor{agg: agg, secret: secret}
+func New(s *store.Store, secret string) *Ingestor {
+	return &Ingestor{store: s, secret: secret}
 }
 
 func (ing *Ingestor) Handle(w http.ResponseWriter, r *http.Request) {
@@ -44,7 +46,27 @@ func (ing *Ingestor) Handle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "server_id required", http.StatusBadRequest)
 		return
 	}
-	ing.agg.Add(smpl)
+	// 实时数据仅刷新 latest_snapshot，供前端展示最新状态，不落历史库。
+	// 历史聚合由被控在本地完成并通过 /api/history 上传。
+	cores := smpl.CPUCores
+	memTotal := smpl.MemTotal
+	diskTotal := smpl.DiskTotal
+	snap := metrics.AggRow{
+		ServerID:  smpl.ServerID,
+		TS:        smpl.TS,
+		CPU:       smpl.CPU,
+		Mem:       smpl.Mem,
+		Disk:      smpl.Disk,
+		NetIn:     smpl.NetIn,
+		NetOut:    smpl.NetOut,
+		CPUCores:  &cores,
+		MemTotal:  &memTotal,
+		DiskTotal: &diskTotal,
+		Pings:     smpl.Pings,
+	}
+	// UpsertServer 同步保证列表立即可见；UpdateSnapshot 刷新实时快照
+	_ = ing.store.UpsertServer(r.Context(), smpl.ServerID, smpl.Name, smpl.IP)
+	go ing.store.UpdateSnapshot(context.Background(), snap)
 	w.WriteHeader(http.StatusAccepted)
 	w.Write([]byte(`{"ok":true}`))
 }

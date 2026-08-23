@@ -12,15 +12,13 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
-	"promonitor/server/internal/aggregator"
 	"promonitor/server/internal/api"
 	"promonitor/server/internal/auth"
 	"promonitor/server/internal/config"
+	"promonitor/server/internal/history"
 	"promonitor/server/internal/ingest"
 	"promonitor/server/internal/store"
 )
-
-const pingNodes = 50
 
 func main() {
 	cfg := config.Load()
@@ -69,11 +67,9 @@ func main() {
 		}
 	}()
 
-	agg := aggregator.New(st, pingNodes)
-	agg.Start(ctx)
-
-	ing := ingest.New(agg, cfg.HMACSecret)
-	ap := api.New(st, a, ing, cfg.PingType)
+	ing := ingest.New(st, cfg.HMACSecret)
+	hist := history.New(st, cfg.HMACSecret)
+	ap := api.New(st, a, ing, hist, cfg.PingType)
 
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)

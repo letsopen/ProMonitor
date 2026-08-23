@@ -14,11 +14,13 @@ const j = (o) => JSON.stringify(o)
 const ok = (cond, msg) => { console.log((cond ? 'PASS ' : 'FAIL ') + msg); if (!cond) process.exitCode = 1 }
 
 async function main() {
-  // 1) 被控上报（HMAC 验签）
+  // 1) 被控实时上报（HMAC 验签），含硬件/容量信息
+  const now = Math.floor(Date.now() / 1000)
   const sample = {
     server_id: 'srv-001', name: 'web-01', ip: '10.0.0.5',
     cpu: 33.2, mem: 55.1, disk: 70.0, net_in: 12.3, net_out: 4.5,
-    ping_nodes: [23.1, -1, 999.0, 45.6], ts: Math.floor(Date.now() / 1000),
+    cpu_cores: 4, mem_total_mb: 8192, disk_total_gb: 256,
+    ping_nodes: [23.1, -1, 999.0, 45.6], ts: now,
   }
   const body = j(sample)
   const sig = hmac(body)
@@ -97,13 +99,33 @@ async function main() {
   r = await fetch(`${BASE}/api/admin/logout`, { method: 'POST', headers: jar2 })
   ok(r.status === 200, `logout -> ${r.status}`)
 
-  // 10) 历史接口（聚合 10 分钟才落库，初次应为空数组但不报错）
+  // 10) 历史接口（初次应为空数组但不报错）
   r = await fetch(`${BASE}/api/servers/srv-001/metrics?range=24h`)
   ok(r.status === 200, `GET metrics -> ${r.status}`)
   data = await r.json()
   ok(Array.isArray(data.metrics), 'metrics is an array (empty ok)')
 
-  // 11) ping 节点 CRUD（管理后台，需登录）
+  // 11) 被控通过 /api/history 批量上报 10 分钟聚合数据
+  const bucket = Math.floor(now / 600) * 600
+  const historyPayload = {
+    server_id: 'srv-001', name: 'web-01', ip: '10.0.0.5',
+    rows: [
+      { ts: bucket, cpu_avg: 30, mem_avg: 50, disk_avg: 60, net_in_avg: 10, net_out_avg: 5, ping_nodes: [20, -1] },
+    ],
+  }
+  const histBody = j(historyPayload)
+  r = await fetch(`${BASE}/api/history`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Signature': hmac(histBody) }, body: histBody,
+  })
+  ok(r.status === 202, `history valid signature -> ${r.status}`)
+
+  // 稍等异步写入后，历史接口应能查到刚才的点
+  await sleep(200)
+  r = await fetch(`${BASE}/api/servers/srv-001/metrics?from=${bucket * 1000}&to=${(bucket + 600) * 1000}`)
+  data = await r.json()
+  ok(data.metrics.some((m) => m.ts === bucket), 'history row persisted')
+
+  // 12) ping 节点 CRUD（管理后台，需登录）
   r = await fetch(`${BASE}/api/admin/ping-nodes`, { method: 'GET' })
   ok(r.status === 401, 'unauth list ping-nodes -> 401')
 

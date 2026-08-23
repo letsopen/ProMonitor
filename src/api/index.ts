@@ -10,6 +10,9 @@ export interface ServerView {
   disk: number | null
   net_in: number | null
   net_out: number | null
+  cpu_cores: number | null
+  mem_total_mb: number | null
+  disk_total_gb: number | null
   pings: number[] // 各节点延迟(ms)，无效为 null
   updated_at: string
 }
