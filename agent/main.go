@@ -262,6 +262,17 @@ func (h *HistoryManager) Add(smpl *Sample) {
 	h.netOutSum += smpl.NetOut
 	h.name = smpl.Name
 	h.ip = smpl.IP
+	// 节点列表可能动态变化，确保 ping 累加数组长度与样本一致。
+	if len(smpl.Pings) != len(h.pingSum) {
+		newSum := make([]float64, len(smpl.Pings))
+		newCnt := make([]int, len(smpl.Pings))
+		for i := 0; i < len(h.pingSum) && i < len(smpl.Pings); i++ {
+			newSum[i] = h.pingSum[i]
+			newCnt[i] = h.pingCnt[i]
+		}
+		h.pingSum = newSum
+		h.pingCnt = newCnt
+	}
 	for i := 0; i < len(h.pingSum) && i < len(smpl.Pings); i++ {
 		v := smpl.Pings[i]
 		if v >= 0 && v <= 1000 {
