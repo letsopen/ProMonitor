@@ -41,6 +41,9 @@ async function main() {
   ok(r.status === 200, `anonymous GET /api/servers -> ${r.status}`)
   let data = await r.json()
   ok(Array.isArray(data.servers) && data.servers.some((s) => s.id === 'srv-001'), 'anonymous list contains srv-001 (auto-registered)')
+  const srv001 = data.servers.find((s) => s.id === 'srv-001')
+  ok(!!srv001 && srv001.cpu != null && srv001.mem != null && srv001.updated_at != null,
+     'latest_snapshot fields populated after ingest (' + JSON.stringify({cpu: srv001.cpu, mem: srv001.mem, updated_at: srv001.updated_at}) + ')')
 
   // 2b) 公开端点 /api/ping-config 返回探测配置（被控拉取用）
   r = await fetch(`${BASE}/api/ping-config`)

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -107,10 +108,47 @@ func New(ctx context.Context, dbPath string) (*Store, error) {
 	if _, err := db.ExecContext(ctx, schemaDDL); err != nil {
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
+	// 兼容旧库：latest_snapshot 表可能缺少后续新增的列
+	if err := migrateLatestSnapshot(ctx, db); err != nil {
+		return nil, fmt.Errorf("migrate latest_snapshot: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
+
+// migrateLatestSnapshot 对旧库执行列级迁移：latest_snapshot 表可能在早期版本
+// 不存在 cpu_cores / mem_total / disk_total / updated_at 等列。SQLite 不支持
+// "ADD COLUMN IF NOT EXISTS"，因此逐个尝试添加并忽略重复列错误。
+func migrateLatestSnapshot(ctx context.Context, db *sql.DB) error {
+	cols := []string{
+		"ALTER TABLE latest_snapshot ADD COLUMN cpu INTEGER",
+		"ALTER TABLE latest_snapshot ADD COLUMN mem REAL",
+		"ALTER TABLE latest_snapshot ADD COLUMN disk REAL",
+		"ALTER TABLE latest_snapshot ADD COLUMN net_in REAL",
+		"ALTER TABLE latest_snapshot ADD COLUMN net_out REAL",
+		"ALTER TABLE latest_snapshot ADD COLUMN cpu_cores INTEGER",
+		"ALTER TABLE latest_snapshot ADD COLUMN mem_total INTEGER",
+		"ALTER TABLE latest_snapshot ADD COLUMN disk_total INTEGER",
+		"ALTER TABLE latest_snapshot ADD COLUMN pings TEXT",
+		"ALTER TABLE latest_snapshot ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0",
+	}
+	for _, sql := range cols {
+		_, err := db.ExecContext(ctx, sql)
+		if err != nil && !isDuplicateColumn(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+func isDuplicateColumn(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "duplicate column name") || strings.Contains(msg, "already exists")
+}
 
 // --- 管理员 ---
 
@@ -201,7 +239,7 @@ func (s *Store) UpdateSnapshot(ctx context.Context, a metrics.AggRow) error {
 	pings, _ := json.Marshal(a.Pings)
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO latest_snapshot(server_id, cpu, mem, disk, net_in, net_out, cpu_cores, mem_total, disk_total, pings, updated_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,?)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?)
 		 ON CONFLICT(server_id) DO UPDATE SET
 		   cpu=excluded.cpu, mem=excluded.mem, disk=excluded.disk,
 		   net_in=excluded.net_in, net_out=excluded.net_out,

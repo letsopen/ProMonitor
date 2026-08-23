@@ -1,6 +1,6 @@
 -- ProMonitor 初始化迁移（SQLite，单文件 + WAL）
--- 说明：服务端启动时已通过 server/internal/store/schema.sql 自动执行等价 DDL，
---       本文件仅作为人工审阅/手动初始化的参考，内容与嵌入 schema 保持一致。
+-- 说明：服务端启动时已通过 server/internal/store/store.go 内嵌 schemaDDL 自动执行等价 DDL，
+--       本文件仅作为人工审阅/手动初始化的参考，内容与内嵌 schema 保持一致。
 -- 30 天保留由应用层 PruneOld() 执行（DELETE + VACUUM），不依赖分区。
 
 PRAGMA foreign_keys = ON;
@@ -36,12 +36,26 @@ CREATE TABLE IF NOT EXISTS latest_snapshot (
     disk        REAL,
     net_in      REAL,
     net_out     REAL,
+    cpu_cores   INTEGER,
+    mem_total   INTEGER,
+    disk_total  INTEGER,
     pings       TEXT,
-    FOREIGN KEY (server_id) REFERENCES servers(id) ON DELETE CASCADE
+    updated_at  INTEGER NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_latest_snapshot_updated
+    ON latest_snapshot (updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS admin_users (
     username      TEXT PRIMARY KEY,
     password_hash TEXT NOT NULL,
     created_at    INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ping_nodes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    ip          TEXT NOT NULL,                -- 仅 IPv4
+    port        INTEGER NOT NULL DEFAULT 80,  -- TCP 探测端口
+    created_at  INTEGER NOT NULL
 );

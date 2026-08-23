@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io/ioutil"
+	"log"
 	"net/http"
 
 	"promonitor/server/internal/metrics"
@@ -65,8 +66,14 @@ func (ing *Ingestor) Handle(w http.ResponseWriter, r *http.Request) {
 		Pings:     smpl.Pings,
 	}
 	// UpsertServer 同步保证列表立即可见；UpdateSnapshot 刷新实时快照
-	_ = ing.store.UpsertServer(r.Context(), smpl.ServerID, smpl.Name, smpl.IP)
-	go ing.store.UpdateSnapshot(context.Background(), snap)
+	if err := ing.store.UpsertServer(r.Context(), smpl.ServerID, smpl.Name, smpl.IP); err != nil {
+		log.Printf("upsert server failed: %v", err)
+	}
+	go func() {
+		if err := ing.store.UpdateSnapshot(context.Background(), snap); err != nil {
+			log.Printf("update snapshot failed: %v", err)
+		}
+	}()
 	w.WriteHeader(http.StatusAccepted)
 	w.Write([]byte(`{"ok":true}`))
 }
