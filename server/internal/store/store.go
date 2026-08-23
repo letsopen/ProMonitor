@@ -303,6 +303,7 @@ func (s *Store) ListServers(ctx context.Context) ([]metrics.ServerView, error) {
 		}
 		if len(pings) > 0 {
 			_ = json.Unmarshal(pings, &v.Pings)
+			v.Pings = metrics.NormalizePings(v.Pings)
 		}
 		if updatedAt.Valid {
 			v.UpdatedAt = time.Unix(updatedAt.Int64, 0)
@@ -332,6 +333,7 @@ func (s *Store) GetHistory(ctx context.Context, serverID string, from, to time.T
 		a.TS = ts
 		if len(pings) > 0 {
 			_ = json.Unmarshal(pings, &a.Pings)
+			a.Pings = metrics.NormalizePings(a.Pings)
 		}
 		out = append(out, a)
 	}

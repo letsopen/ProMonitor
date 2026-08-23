@@ -18,18 +18,24 @@ export function timeAgo(iso: string | undefined): string {
   return `${Math.floor(diff / 86400000)} 天前`
 }
 
-// 从 ping 数组计算有效延迟的 min / avg / max（<0 为失败哨兵 -1，视为无效；0ms 与正延迟均有效）
+// 从 ping 数组计算有效延迟的 min / avg / max。
+// 约定：归一化后 -1(超时) 已映射为 PingTimeoutMs(9999)，因此 >=9999 视为超时、不参与均值；
+// 0ms 与正延迟均为有效值。返回 timeout 计数供 UI 标注"N 个节点超时"。
+export const PING_TIMEOUT_MS = 9999
+
 export function pingStats(pings: number[] | null | undefined): {
   min: number | null
   avg: number | null
   max: number | null
   valid: number
+  timeout: number
 } {
-  if (!pings || pings.length === 0) return { min: null, avg: null, max: null, valid: 0 }
-  const valid = pings.filter((v) => v != null && v >= 0 && v <= 1000) // -1 为失败哨兵
-  if (valid.length === 0) return { min: null, avg: null, max: null, valid: 0 }
+  if (!pings || pings.length === 0) return { min: null, avg: null, max: null, valid: 0, timeout: 0 }
+  const valid = pings.filter((v) => v != null && v >= 0 && v < PING_TIMEOUT_MS)
+  const timeout = pings.filter((v) => v != null && v >= PING_TIMEOUT_MS).length
+  if (valid.length === 0) return { min: null, avg: null, max: null, valid: 0, timeout }
   const min = Math.min(...valid)
   const max = Math.max(...valid)
   const avg = valid.reduce((a, b) => a + b, 0) / valid.length
-  return { min, avg, max, valid: valid.length }
+  return { min, avg, max, valid: valid.length, timeout }
 }

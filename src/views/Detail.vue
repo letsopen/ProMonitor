@@ -4,7 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import * as echarts from 'echarts'
 import { getServers, getHistory, type AggRow, type ServerView } from '@/api'
-import { formatNet, pingStats } from '@/utils/format'
+import { formatNet, pingStats, PING_TIMEOUT_MS } from '@/utils/format'
 import NavBar from '@/components/NavBar.vue'
 
 const route = useRoute()
@@ -90,54 +90,54 @@ function renderCharts() {
     'KB/s'
   )
 
-  // ping：每个节点一条曲线；无效值（null/-1/>1000）断开不连线
-  const nodeCount = Math.max(0, ...history.value.map((m) => (m.ping_nodes || []).length))
+  // ping：按主控下发的节点配置数生成曲线，每个节点一条且连续展示。
+  // 数据已归一化：-1(超时)→9999ms，0ms 与正延迟均为有效值，不出现断点。
+  // 若某历史行节点数少于配置数，用 9999(超时) 补齐，保证每条配置曲线都有连续数据。
+  const nodeCount = pingNodeNames.value.length
   const series = []
   for (let i = 0; i < nodeCount; i++) {
     const name = pingNodeNames.value[i] || `节点 ${i + 1}`
-    series.push({
-      name,
-      data: history.value.map((m) => {
-        const v = m.ping_nodes?.[i]
-        return v != null && v >= 0 && v <= 1000 ? +v.toFixed(1) : null
-      }),
+    const data = history.value.map((m) => {
+      const v = m.ping_nodes?.[i]
+      if (v == null) return 9999 // 该行缺该节点 → 视为超时，保持连续
+      return +v.toFixed(1)
     })
+    series.push({ name, data })
   }
   if (series.length > 0) {
-    lineChart('ping', 'Ping 延迟 (ms)', times, series, 'ms')
+    lineChart('ping', 'Ping 延迟 (ms，9999=超时)', times, series, 'ms', PING_TIMEOUT_MS)
   } else {
-    lineChart('ping', 'Ping 延迟 (ms)', times, [], 'ms')
+    lineChart('ping', 'Ping 延迟 (ms，9999=超时)', times, [], 'ms', PING_TIMEOUT_MS)
   }
 }
 
-function lineChart(key: string, title: string, times: string[], data: any, unit = '') {
+function lineChart(key: string, title: string, times: string[], data: any, unit = '', timeoutValue?: number) {
   const el = document.getElementById(`chart-${key}`)
   if (!el) return
   if (!charts[key]) charts[key] = echarts.init(el)
-  const series = Array.isArray(data) && data[0]?.data
+  const isMulti = Array.isArray(data) && data[0]?.data
+  const series = isMulti
     ? data.map((s: any) => ({ name: s.name, type: 'line', smooth: true, showSymbol: false, data: s.data }))
     : [{ type: 'line', smooth: true, showSymbol: false, areaStyle: { opacity: 0.08 }, data }]
+  const yMax = timeoutValue != null ? timeoutValue * 1.05 : undefined
   charts[key].setOption(
     {
       title: { text: title, left: 'center', textStyle: { fontSize: 14 } },
-      tooltip: { trigger: 'axis' },
+      tooltip: {
+        trigger: 'axis',
+        valueFormatter: (val: any) => {
+          if (timeoutValue != null && val === timeoutValue) return '超时'
+          return `${val} ${unit}`
+        },
+      },
       legend: series.length > 1 ? { bottom: 0 } : undefined,
       grid: { left: 50, right: 20, top: 40, bottom: 40 },
       xAxis: { type: 'category', data: times, axisLabel: { fontSize: 10 } },
-      yAxis: { type: 'value', name: unit },
+      yAxis: { type: 'value', name: unit, max: yMax },
       series,
     },
     true
   )
-}
-
-const latestPings = () => {
-  if (history.value.length === 0) return []
-  const last = history.value[history.value.length - 1]
-  return (last.ping_nodes || []).map((v, i) => ({
-    node: pingNodeNames.value[i] || `节点 ${i + 1}`,
-    ms: v == null || v < 0 || v > 1000 ? null : +v.toFixed(1),
-  }))
 }
 
 onMounted(() => {
@@ -184,7 +184,7 @@ watch(timeRange, loadHistory)
         <div class="card"><div class="k">磁盘</div><div class="v">{{ current.disk != null ? current.disk.toFixed(1) + '%' : '-' }}</div></div>
         <div class="card"><div class="k">入站</div><div class="v">{{ formatNet(current.net_in) }}</div></div>
         <div class="card"><div class="k">出站</div><div class="v">{{ formatNet(current.net_out) }}</div></div>
-        <div class="card"><div class="k">Ping 均延迟</div><div class="v">{{ pingStats(current.pings).avg != null ? pingStats(current.pings).avg!.toFixed(0) + ' ms' : '-' }}</div></div>
+        <div class="card"><div class="k">Ping 均延迟</div><div class="v">{{ pingStats(current.pings).avg != null ? pingStats(current.pings).avg!.toFixed(0) + ' ms' : '-' }}<span v-if="pingStats(current.pings).timeout > 0" class="warn-tip"> {{ pingStats(current.pings).timeout }} 超时</span></div></div>
         <div class="card"><div class="k">CPU 核心</div><div class="v">{{ current.cpu_cores != null ? current.cpu_cores + ' 核' : '-' }}</div></div>
         <div class="card"><div class="k">内存容量</div><div class="v">{{ current.mem_total_mb != null ? (current.mem_total_mb / 1024).toFixed(1) + ' GB' : '-' }}</div></div>
         <div class="card"><div class="k">磁盘容量</div><div class="v">{{ current.disk_total_gb != null ? current.disk_total_gb + ' GB' : '-' }}</div></div>
@@ -197,21 +197,6 @@ watch(timeRange, loadHistory)
         <div class="chart-card"><div :id="`chart-disk`" class="chart"></div></div>
         <div class="chart-card"><div :id="`chart-net`" class="chart"></div></div>
         <div class="chart-card full"><div :id="`chart-ping`" class="chart"></div></div>
-      </div>
-
-      <!-- 每节点 Ping 明细 -->
-      <div class="ping-table">
-        <h3>各节点 Ping 延迟（最新采样）</h3>
-        <el-table :data="latestPings()" size="small" max-height="360" style="width: 100%">
-          <el-table-column prop="node" label="节点" width="90" />
-          <el-table-column label="延迟">
-            <template #default="{ row }">
-              <span :class="row.ms == null ? 'muted' : row.ms > 300 ? 'warn' : ''">
-                {{ row.ms == null ? '无效/超时' : row.ms + ' ms' }}
-              </span>
-            </template>
-          </el-table-column>
-        </el-table>
       </div>
     </div>
   </div>
@@ -281,20 +266,11 @@ watch(timeRange, loadHistory)
   width: 100%;
   height: 300px;
 }
-.ping-table {
-  margin-top: 22px;
-}
-.ping-table h3 {
-  font-size: 16px;
-  margin-bottom: 10px;
-  color: #1f2937;
-}
-.muted {
-  color: #c0c4cc;
-}
-.warn {
+.warn-tip {
   color: #f56c6c;
+  font-size: 12px;
   font-weight: 600;
+  margin-left: 4px;
 }
 @media (max-width: 900px) {
   .current {

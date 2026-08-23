@@ -75,3 +75,32 @@ type ServerView struct {
 	Pings      []float64 `json:"pings"`
 	UpdatedAt  time.Time `json:"updated_at"`
 }
+
+// PingTimeoutMs 是探测失败（-1 哨兵）在前端展示时统一映射成的延迟值。
+// 正常 ping 全球任意节点都不会达到这个量级，因此用高位值让超时曲线明显居于顶部，
+// 同时保证曲线连续性（不会出现断点）。
+const PingTimeoutMs = 9999.0
+
+// NormalizePing 把单个探测值转换为前端展示值：
+//   - 失败哨兵 -1 → PingTimeoutMs（超时）
+//   - 其余（>=0，含 0ms 合法值）原样返回
+//
+// 数据库仍存储原始 -1，此映射仅在返回给前端前执行，避免污染历史数据。
+func NormalizePing(v float64) float64 {
+	if v < 0 {
+		return PingTimeoutMs
+	}
+	return v
+}
+
+// NormalizePings 对整个数组做 NormalizePing 映射，返回新切片（不修改入参）。
+func NormalizePings(in []float64) []float64 {
+	if len(in) == 0 {
+		return in
+	}
+	out := make([]float64, len(in))
+	for i, v := range in {
+		out[i] = NormalizePing(v)
+	}
+	return out
+}
