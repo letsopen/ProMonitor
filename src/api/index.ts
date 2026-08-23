@@ -14,6 +14,13 @@ export interface ServerView {
   updated_at: string
 }
 
+export interface PingNode {
+  id: number
+  name: string
+  ip: string // 仅 IPv4
+  port: number // TCP 探测端口
+}
+
 export interface AggRow {
   server_id: string
   ts: number // unix 秒
@@ -50,3 +57,17 @@ export const updateServer = (id: string, data: { name: string; ip: string }) =>
 
 export const deleteServer = (id: string) =>
   request.delete(`/api/admin/servers/${id}`) as Promise<{ ok: boolean }>
+
+// --- Ping 节点管理（主控统一维护，存库） ---
+
+export const getPingNodes = () =>
+  request.get('/api/admin/ping-nodes') as Promise<{ nodes: PingNode[] }>
+
+export const createPingNode = (data: { name: string; ip: string; port: number }) =>
+  request.post('/api/admin/ping-nodes', data) as Promise<{ ok: boolean; id: number }>
+
+export const updatePingNode = (id: number, data: { name: string; ip: string; port: number }) =>
+  request.put(`/api/admin/ping-nodes/${id}`, data) as Promise<{ ok: boolean }>
+
+export const deletePingNode = (id: number) =>
+  request.delete(`/api/admin/ping-nodes/${id}`) as Promise<{ ok: boolean }>

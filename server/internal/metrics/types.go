@@ -2,6 +2,20 @@ package metrics
 
 import "time"
 
+// PingNode 是主控统一管理的延迟探测节点
+type PingNode struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+	IP   string `json:"ip"`   // 仅 IPv4
+	Port int    `json:"port"` // TCP 探测端口
+}
+
+// PingConfigView 是被控拉取的网络探测配置（主控统一下发）
+type PingConfigView struct {
+	Type  string     `json:"type"` // "icmp" | "tcp"
+	Nodes []PingNode `json:"nodes"`
+}
+
 // Sample 是被控 Agent 上报的单次原始样本（高频，不落库）
 type Sample struct {
 	ServerID string    `json:"server_id"`

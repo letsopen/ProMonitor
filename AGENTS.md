@@ -33,7 +33,7 @@ Dockerfile / docker-compose.yml / .dockerignore   容器化部署
 被控Agent(Go) --HMAC签名 POST--> 主控 /api/ingest --按测量时间聚合--> SQLite(metrics_agg)
         |                                              |                          |
         |--GET /api/ping-config(每5分钟)--> 探测配置     latest_snapshot   30天保留(DELETE+VACUUM)
-        |   (主控统一管理 PING_METHOD/PING_PORT/PING_NODES)                       |
+        |   (主控统一管理 PING_TYPE + SQLite ping_nodes 表)                       |
 Vue前端 <--GET /api/servers(轮询10s)-- 读取最新快照(latest_snapshot JOIN)
 Vue前端 <--GET /api/servers/:id/metrics-- 读取30天聚合历史
 ```
@@ -41,7 +41,7 @@ Vue前端 <--GET /api/servers/:id/metrics-- 读取30天聚合历史
 ## 关键设计决策
 - **高频原始数据不落库**：`/api/ingest` 仅验签 + 写入进程内内存聚合缓冲；每 10 分钟结算 1 行均值落库。
 - **数据时间 = 被控测量时间**：样本 `ts` 为测量时间（unix 秒），聚合按 `floor(ts/600)*600` 对齐到 10 分钟桶，落库 `ts` 即桶起点。网络故障积压的数据补传后落在真实时间点，不污染恢复时刻的曲线。
-- **ping 节点主控统一下发**：`GET /api/ping-config`（匿名）返回 `{method, port, nodes}`；被控启动拉取 + 每 5 分钟热更新；`-targets` 仅作主控未配置时的回退。
+- **ping 节点主控统一下发**：`GET /api/ping-config`（匿名）返回 `{type, nodes}`；节点清单存在 SQLite `ping_nodes` 表，由管理后台 `GET/POST/PUT/DELETE /api/admin/ping-nodes` 维护；被控启动拉取 + 每 5 分钟热更新；`-targets` 仅作主控未配置节点时的回退。
 - **被控积压重试**：Agent 内存队列（上限 500）+ 指数退避重试（2s→60s，最多 5 次），失败不丢数据，恢复自动续传。
 - **缓存 = 纯进程内内存**，无 Redis（资源敏感、单实例）。
 - **首次上报即注册**：聚合器在窗口首次出现该 server 时异步 `UpsertServer`，被控无需先在管理页添加。
@@ -57,7 +57,9 @@ Vue前端 <--GET /api/servers/:id/metrics-- 读取30天聚合历史
 - 传输安全：自托管/容器内由前置 nginx 反代终结 TLS（主控本身不内置 HTTPS）。
 
 ## 环境变量（主控）
-`DB_PATH`(必填，容器默认 /app/data/promonitor.db) / `HMAC_SECRET`(必填) / `ADMIN_USER`(默认 admin) / `ADMIN_PASS`(首次种子) / `SESSION_SECRET` / `PORT`(默认 9000) / `FRONTEND_DIR`(默认 ./dist) / `PING_METHOD`(默认 tcp) / `PING_PORT`(默认 80) / `PING_NODES`(逗号分隔，≤50)
+`DB_PATH`(必填，容器默认 /app/data/promonitor.db) / `HMAC_SECRET`(必填) / `ADMIN_USER`(默认 admin) / `ADMIN_PASS`(首次种子) / `SESSION_SECRET` / `PORT`(默认 9000) / `FRONTEND_DIR`(默认 ./dist) / `PING_TYPE`(默认 tcp)
+
+ping 节点清单不再通过环境变量维护，而是通过管理后台“延迟节点”页面存 SQLite `ping_nodes` 表。
 
 ## 部署（Docker，推荐）
 
@@ -66,15 +68,14 @@ Vue前端 <--GET /api/servers/:id/metrics-- 读取30天聚合历史
 # TCP 探测（默认）
 docker run -d --name promonitor --restart unless-stopped -p 9000:9000 \
   -e HMAC_SECRET='<随机长串>' -e ADMIN_PASS='<初始密码>' -e SESSION_SECRET='<随机串>' \
-  -e PING_METHOD=tcp -e PING_PORT=80 -e PING_NODES='8.8.8.8,1.1.1.1' \
-  -v promonitor-data:/app/data promonitor:latest
+  -e PING_TYPE=tcp -v promonitor-data:/app/data promonitor:latest
 
 # ICMP 探测：必须加 --cap-add NET_RAW（Alpine 默认无 CAP_NET_RAW，不加则探测全失败）
 docker run -d --name promonitor --restart unless-stopped -p 9000:9000 --cap-add NET_RAW \
   -e HMAC_SECRET='<随机长串>' -e ADMIN_PASS='<初始密码>' -e SESSION_SECRET='<随机串>' \
-  -e PING_METHOD=icmp -e PING_NODES='8.8.8.8,1.1.1.1' \
-  -v promonitor-data:/app/data promonitor:latest
+  -e PING_TYPE=icmp -v promonitor-data:/app/data promonitor:latest
 # 访问 http://<host>:9000 ；数据持久化在 promonitor-data 卷
+# 进入管理后台 → 延迟节点 中添加探测节点（id/name/ip/port），被控会自动拉取
 ```
 
 ### docker run（被控 Agent）
@@ -94,10 +95,11 @@ docker run -d --name promonitor-agent --restart unless-stopped --network host --
 
 ### docker compose（备选）
 ```
-cp .env.example .env      # 填 HMAC_SECRET、ADMIN_PASS，可选填 PING_*
+cp .env.example .env      # 填 HMAC_SECRET、ADMIN_PASS，可选填 PING_TYPE
 docker compose up -d --build
 # 访问 http://<host>:9000 ；数据持久化在 promonitor-data 卷
 # 使用 ICMP 时需在 docker-compose.yml 的 promonitor 服务加 cap_add: [NET_RAW]
+# 进入管理后台 → 延迟节点 中添加探测节点
 ```
 
 ## 被控 Agent 启动参数

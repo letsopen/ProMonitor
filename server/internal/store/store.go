@@ -60,6 +60,14 @@ CREATE TABLE IF NOT EXISTS admin_users (
     password_hash TEXT NOT NULL,
     created_at    INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS ping_nodes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    ip          TEXT NOT NULL,                -- 仅 IPv4
+    port        INTEGER NOT NULL DEFAULT 80,  -- TCP 探测端口
+    created_at  INTEGER NOT NULL
+);
 `
 
 // Store 封装 SQLite 访问（database/sql + 纯 Go 驱动，无 cgo，仍是单二进制）
@@ -280,5 +288,46 @@ func (s *Store) PruneOld(ctx context.Context, retentionDays int) (int64, error) 
 // Vacuum 回收被删除行占用的空间（保留期清理后调用，避免文件膨胀）
 func (s *Store) Vacuum(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, `VACUUM`)
+	return err
+}
+
+// --- Ping 节点管理（主控统一维护，被控经 /api/ping-config 拉取） ---
+
+func (s *Store) ListPingNodes(ctx context.Context) ([]metrics.PingNode, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, name, ip, port FROM ping_nodes ORDER BY id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]metrics.PingNode, 0)
+	for rows.Next() {
+		var n metrics.PingNode
+		if err := rows.Scan(&n.ID, &n.Name, &n.IP, &n.Port); err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) CreatePingNode(ctx context.Context, name, ip string, port int) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO ping_nodes(name, ip, port, created_at) VALUES(?,?,?,?)`,
+		name, ip, port, time.Now().Unix())
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+func (s *Store) UpdatePingNode(ctx context.Context, id int64, name, ip string, port int) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE ping_nodes SET name=?, ip=?, port=? WHERE id=?`, name, ip, port, id)
+	return err
+}
+
+func (s *Store) DeletePingNode(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM ping_nodes WHERE id=?`, id)
 	return err
 }

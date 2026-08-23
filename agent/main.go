@@ -36,11 +36,18 @@ type Sample struct {
 	Pings    []float64 `json:"pings"`
 }
 
+// PingNode 是主控统一下发的探测节点
+type PingNode struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+	IP   string `json:"ip"`   // 仅 IPv4
+	Port int    `json:"port"` // TCP 探测端口
+}
+
 // PingConfig 是主控下发的网络探测配置
 type PingConfig struct {
-	Method string   `json:"method"` // "icmp" | "tcp"
-	Port   int      `json:"port"`
-	Nodes  []string `json:"nodes"`
+	Type  string     `json:"type"` // "icmp" | "tcp"
+	Nodes []PingNode `json:"nodes"`
 }
 
 // AgentConfig 是被控运行参数
@@ -313,11 +320,11 @@ func collect(cfg AgentConfig, pc PingConfig) *Sample {
 
 	pings := make([]float64, len(pc.Nodes))
 	for i, n := range pc.Nodes {
-		switch pc.Method {
+		switch pc.Type {
 		case "icmp":
-			pings[i] = measureICMPPing(n, 1*time.Second)
-		default:
-			pings[i] = measureTCPPing(n, pc.Port, 1*time.Second)
+			pings[i] = measureICMPPing(n.IP, 1*time.Second)
+		default: // tcp：使用节点自身配置的端口
+			pings[i] = measureTCPPing(n.IP, n.Port, 1*time.Second)
 		}
 	}
 
@@ -358,16 +365,25 @@ func main() {
 
 	cfg := AgentConfig{Master: *master, Secret: *secret, SID: *sid, Name: *name, IP: *ip}
 
+	// 本地回退节点：把逗号分隔的 host 转成 PingNode（TCP 用默认端口 80）
+	localNodes := func() []PingNode {
+		var out []PingNode
+		for _, h := range splitTargets(*targets, 50) {
+			out = append(out, PingNode{Name: h, IP: h, Port: 80})
+		}
+		return out
+	}
+
 	// 初始拉取探测配置；失败则用本地覆盖或空节点
-	pc := PingConfig{Method: "tcp", Port: 80}
+	pc := PingConfig{Type: "tcp"}
 	npc, err := fetchPingConfig(*master)
 	if err != nil {
 		log.Printf("warn: fetch ping-config failed (%v); fallback to local targets", err)
-		pc.Nodes = splitTargets(*targets, 50)
+		pc.Nodes = localNodes()
 	} else {
-		log.Printf("ping-config: method=%s port=%d nodes=%d", npc.Method, npc.Port, len(npc.Nodes))
+		log.Printf("ping-config: type=%s nodes=%d", npc.Type, len(npc.Nodes))
 		if len(npc.Nodes) == 0 && *targets != "" {
-			npc.Nodes = splitTargets(*targets, 50)
+			npc.Nodes = localNodes()
 		}
 		pc = npc
 	}
@@ -386,10 +402,10 @@ func main() {
 		for range t.C {
 			if npc, err := fetchPingConfig(*master); err == nil {
 				if len(npc.Nodes) == 0 && *targets != "" {
-					npc.Nodes = splitTargets(*targets, 50)
+					npc.Nodes = localNodes()
 				}
 				cfgStore.Store(npc)
-				log.Printf("ping-config refreshed: method=%s nodes=%d", npc.Method, len(npc.Nodes))
+				log.Printf("ping-config refreshed: type=%s nodes=%d", npc.Type, len(npc.Nodes))
 			}
 		}
 	}()

@@ -40,19 +40,16 @@
 ## 4.1 网络延迟节点：主控统一管理（v4 新增）
 - **节点清单由主控统一配置**，不再是各被控本地硬编码。主控新增**公开匿名端点** `GET /api/ping-config`，返回：
   ```json
-  { "method": "icmp" | "tcp", "port": 80, "nodes": ["1.1.1.1", "8.8.8.8", "..."] }
+  { "type": "icmp" | "tcp", "nodes": [{"id":1,"name":"...","ip":"1.1.1.1","port":80}, ...] }
   ```
-- 配置来源为环境变量（无数据库依赖，重启即生效）：
-  - `PING_METHOD`：`icmp` 或 `tcp`，**默认 `tcp`**。
-  - `PING_PORT`：TCP 探测端口，默认 `80`（仅 `method=tcp` 生效）。
-  - `PING_NODES`：逗号分隔节点清单，最多 50 个。
-- **被控拉取策略**：Agent 启动时拉取一次；之后每 **5 分钟**重新拉取（配置热更新，无需重启 Agent）。本地 `-targets` 旗标作为可选覆盖（仅当主控未配置任何节点时回退使用）。
-- ⚠️ **ICMP 容器限制**：Alpine 容器内默认无 `CAP_NET_RAW`，raw socket 建不了，ICMP 探测会失败。要让 `method=icmp` 生效，主控/Agent 容器启动时需加 `--cap-add NET_RAW`：
+- 探测方式来自环境变量 `PING_TYPE`（`tcp` 或 `icmp`，默认 `tcp`）。
+- 节点清单存 SQLite `ping_nodes(id, name, ip, port, created_at)` 表，由管理后台维护：
+- ⚠️ **ICMP 容器限制**：Alpine 容器内默认无 `CAP_NET_RAW`，raw socket 建不了，ICMP 探测会失败。要让 `PING_TYPE=icmp` 生效，主控/Agent 容器启动时需加 `--cap-add NET_RAW`：
   ```bash
   # 主控
   docker run -d --name promonitor --restart unless-stopped -p 9000:9000 --cap-add NET_RAW \
     -e HMAC_SECRET='...' -e ADMIN_PASS='...' -e SESSION_SECRET='...' \
-    -e PING_METHOD=icmp -e PING_NODES='8.8.8.8,1.1.1.1' -v promonitor-data:/app/data promonitor:latest
+    -e PING_TYPE=icmp -v promonitor-data:/app/data promonitor:latest
   # 被控 Agent（探测在 Agent 侧执行，同样需要该能力）
   docker run -d --name promonitor-agent --restart unless-stopped --network host --cap-add NET_RAW \
     -e MASTER_URL='http://<主控IP>:9000' -e HMAC_SECRET='...' -e SERVER_ID='web-01' promonitor:latest promonitor-agent
@@ -73,7 +70,8 @@
 
 
 - `servers(id, name, ip, secret, status, created_at)` — 被控元数据。`created_at` 用 unix 秒整数。
-- `metrics_agg(server_id, ts, cpu_avg, mem_avg, disk_avg, net_in_avg, net_out_avg, ping_nodes TEXT)` — 聚合结果。**ts 为 unix 秒整数**（排序/保留期清理都靠它）。50 节点压成 1 行 JSON 数组。
+- `ping_nodes(id PK, name, ip, port, created_at)` — 探测节点清单，由管理后台维护。
+- `metrics_agg(server_id, ts, cpu_avg, mem_avg, disk_avg, net_in_avg, net_out_avg, ping_nodes TEXT)` — 聚合结果。**ts 为 unix 秒整数**（排序/保留期清理都靠它）。50 节点压成 1 行 JSON数组。
 - `latest_snapshot(server_id PK, cpu, mem, disk, net_in, net_out, pings, updated_at)` — 列表/详情实时读。`server_id` 外键 `ON DELETE CASCADE`。
 - `admin_users(username PK, password_hash, created_at)` — 单 admin。
 - **30 天保留**：不做分区（SQLite 无原生分区），由应用层 `PruneOld(30)` 执行 `DELETE FROM metrics_agg WHERE ts < now-30d`，随后 `VACUUM` 回收空间。启动时与每日定时各跑一次。数据量极小，`DELETE` + `VACUUM` 远快于 PostgreSQL 分区 `DROP`，且更简单。
@@ -105,7 +103,7 @@
 | GET | `/api/servers` | 匿名 | 列表（含最新快照） |
 | GET | `/api/servers/latest` | 匿名 | 轮询最新占用 |
 | GET | `/api/servers/:id/metrics?from&to` | 匿名 | 历史聚合 |
-| GET | `/api/ping-config` | 匿名 | 被控拉取探测配置（method/port/nodes） |
+| GET | `/api/ping-config` | 匿名 | 被控拉取探测配置（type/nodes，nodes 来自 ping_nodes 表） |
 | POST | `/api/admin/login` | 公开 | 登录 |
 | POST | `/api/admin/logout` | 登录 | 登出 |
 | POST | `/api/admin/change-password` | admin | 改密 |
@@ -113,12 +111,16 @@
 | PUT | `/api/admin/servers/:id` | admin | 编辑 |
 | DELETE | `/api/admin/servers/:id` | admin | 删除 |
 
+| POST | `/api/admin/ping-nodes` | admin | 新增探测节点 |
+| PUT | `/api/admin/ping-nodes/{id}` | admin | 编辑探测节点 |
+| DELETE | `/api/admin/ping-nodes/{id}` | admin | 删除探测节点 |
+
 ## 9. 部署（自托管）
 - `scripts/setup.sh`：装 Go → `cd server && go mod tidy && CGO_ENABLED=0 go build -o ../bin/server` → 前端 `npm i && npm run build`。
 - `scripts/start.sh`：设置环境变量后 `exec ./bin/server`（监听 `:9000`，托管 `dist/`）。
 - **守护进程**（任选）：systemd unit 或 supervisor，保证崩溃自启。
 - **HTTPS**：在前面套 `nginx` / `caddy` 反代 `localhost:9000`，由反代终结 TLS（caddy 自动证书最省心）。
-- **环境变量**：`DB_PATH`(默认 `./promonitor.db`) / `HMAC_SECRET`(必填) / `ADMIN_USER`(默认 admin) / `ADMIN_PASS`(首次种子) / `SESSION_SECRET` / `PORT`(默认 9000) / `FRONTEND_DIR`(默认 `./dist`) / `PING_METHOD`(默认 tcp) / `PING_PORT`(默认 80) / `PING_NODES`(逗号分隔，≤50)。
+- **环境变量**：`DB_PATH`(默认 `./promonitor.db`) / `HMAC_SECRET`(必填) / `ADMIN_USER`(默认 admin) / `ADMIN_PASS`(首次种子) / `SESSION_SECRET` / `PORT`(默认 9000) / `FRONTEND_DIR`(默认 `./dist`) / `PING_TYPE`(默认 tcp)。节点清单通过管理后台存 `ping_nodes` 表。。
 - 被控 Agent 部署：把 `agent` 编译出的二进制放到各被控机，以 `HMAC_SECRET` 与主控地址启动即可；延迟节点与方法由主控统一下发，无需在被控侧配置。
 
 ## 10. 目录结构

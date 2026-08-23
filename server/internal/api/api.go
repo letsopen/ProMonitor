@@ -4,32 +4,27 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"promonitor/server/internal/auth"
 	"promonitor/server/internal/ingest"
+	"promonitor/server/internal/metrics"
 	"promonitor/server/internal/store"
 )
 
 // API 聚合所有 HTTP 处理器
 type API struct {
-	store  *store.Store
-	auth   *auth.Auth
-	ingest *ingest.Ingestor
-	ping   PingConfigView
+	store    *store.Store
+	auth     *auth.Auth
+	ingest   *ingest.Ingestor
+	pingType string // "icmp" | "tcp"，来自环境变量 PING_TYPE
 }
 
-// PingConfigView 是被控拉取的网络探测配置（主控统一下发）
-type PingConfigView struct {
-	Method string   `json:"method"` // "icmp" | "tcp"
-	Port   int      `json:"port"`   // TCP 探测端口
-	Nodes  []string `json:"nodes"`  // 探测节点清单
-}
-
-func New(s *store.Store, a *auth.Auth, ing *ingest.Ingestor, ping PingConfigView) *API {
-	return &API{store: s, auth: a, ingest: ing, ping: ping}
+func New(s *store.Store, a *auth.Auth, ing *ingest.Ingestor, pingType string) *API {
+	return &API{store: s, auth: a, ingest: ing, pingType: pingType}
 }
 
 // Routes 注册全部路由
@@ -49,6 +44,11 @@ func (api *API) Routes(r *chi.Mux) {
 		pr.Post("/api/admin/servers", api.createServer)
 		pr.Put("/api/admin/servers/{id}", api.updateServer)
 		pr.Delete("/api/admin/servers/{id}", api.deleteServer)
+		// Ping 节点管理（存库，主控统一维护）
+		pr.Get("/api/admin/ping-nodes", api.listPingNodes)
+		pr.Post("/api/admin/ping-nodes", api.createPingNode)
+		pr.Put("/api/admin/ping-nodes/{id}", api.updatePingNode)
+		pr.Delete("/api/admin/ping-nodes/{id}", api.deletePingNode)
 	})
 }
 
@@ -96,13 +96,94 @@ func (api *API) history(w http.ResponseWriter, r *http.Request) {
 }
 
 // pingConfig 返回主控统一管理的网络探测配置，供所有被控拉取（无需鉴权，
-// 因为被控在注册/HMAC 之前就需要它来决定怎么测延迟）。
+// 因为被控在注册/HMAC 之前就需要它来决定怎么测延迟）。节点列表从库读取。
 func (api *API) pingConfig(w http.ResponseWriter, r *http.Request) {
-	nodes := api.ping.Nodes
-	if nodes == nil {
-		nodes = []string{}
+	nodes, err := api.store.ListPingNodes(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
-	writeJSON(w, PingConfigView{Method: api.ping.Method, Port: api.ping.Port, Nodes: nodes})
+	writeJSON(w, metrics.PingConfigView{Type: api.pingType, Nodes: nodes})
+}
+
+// --- Ping 节点管理（admin） ---
+
+func (api *API) listPingNodes(w http.ResponseWriter, r *http.Request) {
+	nodes, err := api.store.ListPingNodes(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]interface{}{"nodes": nodes})
+}
+
+type pingNodeReq struct {
+	Name string `json:"name"`
+	IP   string `json:"ip"`
+	Port int    `json:"port"`
+}
+
+func (api *API) createPingNode(w http.ResponseWriter, r *http.Request) {
+	var req pingNodeReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	req.IP = strings.TrimSpace(req.IP)
+	if req.Name == "" || req.IP == "" {
+		http.Error(w, "name and ip required", http.StatusBadRequest)
+		return
+	}
+	if req.Port <= 0 || req.Port > 65535 {
+		req.Port = 80
+	}
+	id, err := api.store.CreatePingNode(r.Context(), req.Name, req.IP, req.Port)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]interface{}{"ok": true, "id": id})
+}
+
+func (api *API) updatePingNode(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		http.Error(w, "bad id", http.StatusBadRequest)
+		return
+	}
+	var req pingNodeReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	req.IP = strings.TrimSpace(req.IP)
+	if req.Name == "" || req.IP == "" {
+		http.Error(w, "name and ip required", http.StatusBadRequest)
+		return
+	}
+	if req.Port <= 0 || req.Port > 65535 {
+		req.Port = 80
+	}
+	if err := api.store.UpdatePingNode(r.Context(), id, req.Name, req.IP, req.Port); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+func (api *API) deletePingNode(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		http.Error(w, "bad id", http.StatusBadRequest)
+		return
+	}
+	if err := api.store.DeletePingNode(r.Context(), id); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]bool{"ok": true})
 }
 
 func parseTime(s string, def time.Time) time.Time {

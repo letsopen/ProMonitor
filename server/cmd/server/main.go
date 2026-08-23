@@ -73,11 +73,7 @@ func main() {
 	agg.Start(ctx)
 
 	ing := ingest.New(agg, cfg.HMACSecret)
-	ap := api.New(st, a, ing, api.PingConfigView{
-		Method: cfg.PingMethod,
-		Port:   cfg.PingPort,
-		Nodes:  cfg.PingNodes,
-	})
+	ap := api.New(st, a, ing, cfg.PingType)
 
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)

@@ -44,7 +44,7 @@ async function main() {
   r = await fetch(`${BASE}/api/ping-config`)
   ok(r.status === 200, `anonymous GET /api/ping-config -> ${r.status}`)
   data = await r.json()
-  ok(['icmp', 'tcp'].includes(data.method) && Array.isArray(data.nodes), 'ping-config shape valid (method/nodes)')
+  ok(['icmp', 'tcp'].includes(data.type) && Array.isArray(data.nodes), 'ping-config shape valid (type/nodes)')
 
   // 3) 未登录访问管理写操作应 401（创建被控在 /api/admin/servers 鉴权组下）
   r = await fetch(`${BASE}/api/admin/servers`, {
@@ -102,6 +102,48 @@ async function main() {
   ok(r.status === 200, `GET metrics -> ${r.status}`)
   data = await r.json()
   ok(Array.isArray(data.metrics), 'metrics is an array (empty ok)')
+
+  // 11) ping 节点 CRUD（管理后台，需登录）
+  r = await fetch(`${BASE}/api/admin/ping-nodes`, { method: 'GET' })
+  ok(r.status === 401, 'unauth list ping-nodes -> 401')
+
+  r = await fetch(`${BASE}/api/admin/login`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: j({ username: ADMIN, password: 'newpass123' }),
+  })
+  const cookie3 = r.headers.get('set-cookie')
+  const jar3 = { 'Cookie': cookie3 }
+
+  r = await fetch(`${BASE}/api/admin/ping-nodes`, { headers: jar3 })
+  ok(r.status === 200, 'authed list ping-nodes -> 200')
+  const initialNodes = (await r.json()).nodes
+  ok(Array.isArray(initialNodes), 'ping-nodes list is array')
+
+  r = await fetch(`${BASE}/api/admin/ping-nodes`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', ...jar3 },
+    body: j({ name: '测试节点', ip: '1.2.3.4', port: 80 }),
+  })
+  ok(r.status === 200, 'create ping-node -> 200')
+  const createdId = (await r.json()).id
+  ok(typeof createdId === 'number' && createdId > 0, 'create ping-node returned id')
+
+  r = await fetch(`${BASE}/api/admin/ping-nodes/${createdId}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json', ...jar3 },
+    body: j({ name: '测试节点改名', ip: '1.2.3.4', port: 443 }),
+  })
+  ok(r.status === 200, 'update ping-node -> 200')
+
+  r = await fetch(`${BASE}/api/admin/ping-nodes`, { headers: jar3 })
+  const afterNodes = (await r.json()).nodes
+  ok(afterNodes.some((n) => n.id === createdId && n.name === '测试节点改名' && n.port === 443), 'updated node reflected in list')
+
+  r = await fetch(`${BASE}/api/admin/ping-nodes/${createdId}`, { method: 'DELETE', headers: jar3 })
+  ok(r.status === 200, 'delete ping-node -> 200')
+
+  r = await fetch(`${BASE}/api/ping-config`)
+  ok(r.status === 200, 'anonymous ping-config -> 200')
+  const pingCfg = await r.json()
+  ok(['icmp', 'tcp'].includes(pingCfg.type) && Array.isArray(pingCfg.nodes), 'ping-config shape valid')
 
   console.log('\nSMOKE_DONE exitCode=' + (process.exitCode || 0))
 }

@@ -77,17 +77,15 @@ docker run -d --name promonitor --restart unless-stopped \
   -e HMAC_SECRET='<与所有被控一致的随机长串>' \
   -e ADMIN_PASS='<初始管理员密码>' \
   -e SESSION_SECRET='<随机串>' \
-  -e PING_METHOD=tcp \
-  -e PING_PORT=80 \
-  -e PING_NODES='8.8.8.8,1.1.1.1,9.9.9.9' \
+  -e PING_TYPE=tcp \
   -v promonitor-data:/app/data \
   promonitor:latest
 
-# 3) 访问面板
-#   http://<你的服务器IP>:9000 ，用 admin / ADMIN_PASS 登录
+# 3) 访问面板 → 管理后台 → 延迟节点 → 添加探测节点（id/name/ip/port）
+#   被控会自动从主控拉取节点清单，无需在环境变量配置
 ```
 
-**若使用 ICMP 延迟探测（`PING_METHOD=icmp`）**：Alpine 容器默认无 `CAP_NET_RAW`，
+**若使用 ICMP 延迟探测（`PING_TYPE=icmp`）**：Alpine 容器默认无 `CAP_NET_RAW`，
 raw socket 无法建立、ICMP 探测会全部失败，必须给容器显式加上该能力：
 
 ```bash
@@ -97,14 +95,13 @@ docker run -d --name promonitor --restart unless-stopped \
   -e HMAC_SECRET='<与所有被控一致的随机长串>' \
   -e ADMIN_PASS='<初始管理员密码>' \
   -e SESSION_SECRET='<随机串>' \
-  -e PING_METHOD=icmp \
-  -e PING_NODES='8.8.8.8,1.1.1.1,9.9.9.9' \
+  -e PING_TYPE=icmp \
   -v promonitor-data:/app/data \
   promonitor:latest
 ```
 
 > 提示：`docker run` 无法直接读取 `.env`，密钥用 `-e KEY=value` 逐项传入；
-> 嫌长可用 `--env-file .env`（此时 `.env` 需含 `HMAC_SECRET`、`ADMIN_PASS`、`PING_*` 等全部变量）。
+> 嫌长可用 `--env-file .env`（此时 `.env` 需含 `HMAC_SECRET`、`ADMIN_PASS`、`PING_TYPE` 等）。
 
 停止 / 查看日志 / 升级：
 ```bash
@@ -129,7 +126,8 @@ docker compose up -d --build
 ```
 
 > compose 使用 ICMP 时同样需要加能力：在 `docker-compose.yml` 的 `promonitor` 服务下加一行
-> `cap_add: [NET_RAW]`（并设置 `PING_METHOD=icmp`）。
+> `cap_add: [NET_RAW]`（并设置 `PING_TYPE=icmp`）。
+> **节点清单**在管理后台 → 延迟节点 维护，不通过 `.env` 配置。
 
 - 数据持久化在名为 `promonitor-data` 的卷（`/app/data`），重建容器不丢数据。
 - 想改端口：`docker-compose.yml` 的 `ports` 改成 `"8080:9000"` 之类。
@@ -146,7 +144,7 @@ Agent 是独立二进制，跑在**被监控的机器**上，不是面板容器�
 用同一个 `promonitor` 镜像，以 `promonitor-agent` 覆盖默认命令启动（无需另装二进制）：
 
 ```bash
-# TCP 延迟探测（默认，跟随主控 PING_METHOD 配置）
+# TCP 延迟探测（默认，跟随主控 PING_TYPE 配置）
 docker run -d --name promonitor-agent --restart unless-stopped \
   --network host \
   -e MASTER_URL='http://<主控IP>:9000' \
@@ -172,8 +170,8 @@ docker run -d --name promonitor-agent --restart unless-stopped \
 ```
 
 > `--network host`：让容器直接使用宿主机网络，便于访问主控并让探测流量走宿主网络栈
-> （探测目标通常是公网，无需 host 也可，但 host 模式最简单）。探测方式/节点由主控
-> 统一下发，被控**无需**再配置 `PING_METHOD`/`PING_NODES`。
+> （探测目标通常是公网，无需 host 也可，但 host 模式最简单）。节点清单由主控
+> 管理后台维护，被控**无需**再配置 `PING_*`。
 
 ### 方式 B：直接跑二进制
 
@@ -233,9 +231,9 @@ flag 与环境变量对照：
 | `ADMIN_PASS`   | 否 | —      | 首次启动以此初始化 admin 密码（docker 推荐通过 .env 设置）|
 | `SESSION_SECRET` | 否 | `change-me-session-secret` | 会话 Cookie 签名密钥 |
 | `FRONTEND_DIR` | 否 | `./dist` | 前端静态目录 |
-| `PING_METHOD`  | 否 | `tcp`   | 延迟探测方式：`tcp`（TCP 端口探测）或 `icmp`（需容器 `--cap-add NET_RAW`）|
-| `PING_PORT`    | 否 | `80`    | `method=tcp` 时的探测端口 |
-| `PING_NODES`   | 否 | —       | 逗号分隔的探测节点清单（最多 50 个），被控通过 `/api/ping-config` 拉取 |
+| `PING_TYPE`    | 否 | `tcp`   | 延迟探测方式：`tcp`（TCP 端口探测）或 `icmp`（需容器 `--cap-add NET_RAW`）|
+
+> 节点清单不再通过环境变量维护，部署后进入 **管理后台 → 延迟节点** 添加（存 SQLite `ping_nodes` 表）。
 
 > `DB_PATH`/`HMAC_SECRET` 在代码中缺失会 `log.Fatal` 退出，属"fail fast"。
 
