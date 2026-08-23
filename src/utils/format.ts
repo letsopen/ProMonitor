@@ -18,7 +18,7 @@ export function timeAgo(iso: string | undefined): string {
   return `${Math.floor(diff / 86400000)} 天前`
 }
 
-// 从 ping 数组计算有效延迟的 min / avg / max（>1000ms 或 null 视为无效）
+// 从 ping 数组计算有效延迟的 min / avg / max（<0 为失败哨兵 -1，视为无效；0ms 与正延迟均有效）
 export function pingStats(pings: number[] | null | undefined): {
   min: number | null
   avg: number | null
@@ -26,7 +26,7 @@ export function pingStats(pings: number[] | null | undefined): {
   valid: number
 } {
   if (!pings || pings.length === 0) return { min: null, avg: null, max: null, valid: 0 }
-  const valid = pings.filter((v) => v != null && v > 0 && v <= 1000) // -1/0 视为无效
+  const valid = pings.filter((v) => v != null && v >= 0 && v <= 1000) // -1 为失败哨兵
   if (valid.length === 0) return { min: null, avg: null, max: null, valid: 0 }
   const min = Math.min(...valid)
   const max = Math.max(...valid)

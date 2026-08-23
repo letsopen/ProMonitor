@@ -14,3 +14,6 @@ smoke*.log
 .plan/
 .todo/
 .websearch/
+
+# local go build caches
+.gocache*/

@@ -99,7 +99,7 @@ function renderCharts() {
       name,
       data: history.value.map((m) => {
         const v = m.ping_nodes?.[i]
-        return v != null && v > 0 && v <= 1000 ? +v.toFixed(1) : null
+        return v != null && v >= 0 && v <= 1000 ? +v.toFixed(1) : null
       }),
     })
   }
@@ -136,7 +136,7 @@ const latestPings = () => {
   const last = history.value[history.value.length - 1]
   return (last.ping_nodes || []).map((v, i) => ({
     node: pingNodeNames.value[i] || `节点 ${i + 1}`,
-    ms: v == null || v <= 0 || v > 1000 ? null : +v.toFixed(1),
+    ms: v == null || v < 0 || v > 1000 ? null : +v.toFixed(1),
   }))
 }
 
