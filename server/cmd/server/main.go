@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -74,6 +77,9 @@ func main() {
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
 	r.Use(corsMiddleware)
+	if cfg.Debug {
+		r.Use(debugRequestResponse)
+	}
 	ap.Routes(r)
 	spaFallback(r, http.Dir(cfg.FrontendDir))
 
@@ -88,6 +94,60 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// debugRequestResponse 打印所有请求的 method/path/请求体（JSON 美化）以及响应体和状态码。
+// 注意：仅对 /api 路径生效，避免静态资源二进制日志刷屏。
+func debugRequestResponse(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		var bodyBytes []byte
+		if r.Body != nil {
+			bodyBytes, _ = io.ReadAll(r.Body)
+			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		}
+		if len(bodyBytes) > 0 {
+			var pretty bytes.Buffer
+			if json.Indent(&pretty, bodyBytes, "", "  ") == nil {
+				log.Printf(">>> %s %s\n%s", r.Method, r.URL.Path, pretty.String())
+			} else {
+				log.Printf(">>> %s %s\n%s", r.Method, r.URL.Path, string(bodyBytes))
+			}
+		} else {
+			log.Printf(">>> %s %s", r.Method, r.URL.Path)
+		}
+		rec := &responseRecorder{ResponseWriter: w, status: http.StatusOK, body: new(bytes.Buffer)}
+		next.ServeHTTP(rec, r)
+		if rec.body.Len() > 0 {
+			var pretty bytes.Buffer
+			if json.Indent(&pretty, rec.body.Bytes(), "", "  ") == nil {
+				log.Printf("<<< %s %s %d\n%s", r.Method, r.URL.Path, rec.status, pretty.String())
+			} else {
+				log.Printf("<<< %s %s %d\n%s", r.Method, r.URL.Path, rec.status, rec.body.String())
+			}
+		} else {
+			log.Printf("<<< %s %s %d", r.Method, r.URL.Path, rec.status)
+		}
+	})
+}
+
+type responseRecorder struct {
+	http.ResponseWriter
+	status int
+	body   *bytes.Buffer
+}
+
+func (r *responseRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *responseRecorder) Write(b []byte) (int, error) {
+	r.body.Write(b)
+	return r.ResponseWriter.Write(b)
 }
 
 func corsMiddleware(next http.Handler) http.Handler {

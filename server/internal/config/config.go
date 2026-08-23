@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 )
 
 // Config 持有运行时所需环境变量
@@ -18,6 +19,8 @@ type Config struct {
 	// 探测节点清单不再由环境变量管理，而是存数据库 ping_nodes 表，
 	// 通过管理后台维护、/api/ping-config 下发给被控。
 	PingType string
+	// Debug 控制是否打印所有 HTTP 请求/响应报文（JSON 美化），默认 true。
+	Debug bool
 }
 
 func Load() *Config {
@@ -35,6 +38,9 @@ func Load() *Config {
 		pingType = "tcp"
 	}
 
+	debugStr := strings.ToLower(strings.TrimSpace(os.Getenv("DEBUG")))
+	debug := debugStr != "false" && debugStr != "0" && debugStr != "off"
+
 	return &Config{
 		Port:          port,
 		DBPath:        get("DB_PATH", "./promonitor.db"),
@@ -44,5 +50,6 @@ func Load() *Config {
 		SessionSecret: get("SESSION_SECRET", "change-me-session-secret"),
 		FrontendDir:   get("FRONTEND_DIR", "./dist"),
 		PingType:      pingType,
+		Debug:         debug,
 	}
 }

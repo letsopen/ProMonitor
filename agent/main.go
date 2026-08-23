@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -100,6 +101,7 @@ type AgentConfig struct {
 	Name            string
 	IP              string
 	CollectInterval time.Duration
+	Debug           bool
 }
 
 // 全局变量
@@ -208,6 +210,9 @@ func (s *RealtimeSender) Send(smpl *Sample) {
 	mac.Write(body)
 	sig := hex.EncodeToString(mac.Sum(nil))
 	url := strings.TrimRight(s.cfg.Master, "/") + "/api/ingest"
+	if s.cfg.Debug {
+		log.Printf("[DEBUG] >>> realtime ingest body:\n%s", prettyJSON(body))
+	}
 	req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Signature", sig)
@@ -216,7 +221,11 @@ func (s *RealtimeSender) Send(smpl *Sample) {
 		log.Printf("realtime send error ts=%d: %v", smpl.TS, err)
 		return
 	}
+	respBody, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
+	if s.cfg.Debug {
+		log.Printf("[DEBUG] <<< realtime ingest status=%d body:\n%s", resp.StatusCode, prettyJSON(respBody))
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		log.Printf("realtime send rejected ts=%d: status %d", smpl.TS, resp.StatusCode)
 	}
@@ -330,6 +339,9 @@ func (h *HistoryManager) UploadHistory(rows []AggRow) bool {
 	mac.Write(body)
 	sig := hex.EncodeToString(mac.Sum(nil))
 	url := strings.TrimRight(h.cfg.Master, "/") + "/api/history"
+	if h.cfg.Debug {
+		log.Printf("[DEBUG] >>> history upload body:\n%s", prettyJSON(body))
+	}
 	req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Signature", sig)
@@ -338,7 +350,11 @@ func (h *HistoryManager) UploadHistory(rows []AggRow) bool {
 		log.Printf("history upload error: %v", err)
 		return false
 	}
+	respBody, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
+	if h.cfg.Debug {
+		log.Printf("[DEBUG] <<< history upload status=%d body:\n%s", resp.StatusCode, prettyJSON(respBody))
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		log.Printf("history upload rejected: status %d", resp.StatusCode)
 		return false
@@ -439,20 +455,36 @@ type PendingHistory struct {
 }
 
 // fetchPingConfig 从主控拉取探测配置
-func fetchPingConfig(master string) (PingConfig, error) {
+func fetchPingConfig(master string, debug bool) (PingConfig, error) {
 	var pc PingConfig
 	resp, err := http.Get(strings.TrimRight(master, "/") + "/api/ping-config")
 	if err != nil {
 		return pc, err
 	}
 	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if debug {
+		log.Printf("[DEBUG] <<< ping-config status=%d body:\n%s", resp.StatusCode, prettyJSON(body))
+	}
 	if resp.StatusCode != http.StatusOK {
 		return pc, fmt.Errorf("unexpected status %d", resp.StatusCode)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&pc); err != nil {
+	if err := json.Unmarshal(body, &pc); err != nil {
 		return pc, err
 	}
 	return pc, nil
+}
+
+// prettyJSON 尝试将 JSON 美化缩进，失败则返回原始字符串。
+func prettyJSON(b []byte) string {
+	if len(b) == 0 {
+		return "(empty)"
+	}
+	var out bytes.Buffer
+	if json.Indent(&out, b, "", "  ") != nil {
+		return string(b)
+	}
+	return out.String()
 }
 
 func collect(cfg AgentConfig, pc PingConfig, now time.Time) *Sample {
@@ -527,6 +559,8 @@ func main() {
 	name := flag.String("name", env("SERVER_NAME", ""), "展示名(默认同ID)")
 	ip := flag.String("ip", env("SERVER_IP", ""), "被控IP")
 	interval := flag.Duration("interval", parseCollectInterval(os.Getenv("COLLECT_INTERVAL")), "采集间隔")
+	debugStr := strings.ToLower(strings.TrimSpace(env("DEBUG", "true")))
+	debug := debugStr != "false" && debugStr != "0" && debugStr != "off"
 	flag.Parse()
 
 	if *secret == "" {
@@ -543,10 +577,10 @@ func main() {
 		*interval = defaultCollectInterval
 	}
 
-	cfg := AgentConfig{Master: *master, Secret: *secret, SID: *sid, Name: *name, IP: *ip, CollectInterval: *interval}
+	cfg := AgentConfig{Master: *master, Secret: *secret, SID: *sid, Name: *name, IP: *ip, CollectInterval: *interval, Debug: debug}
 
 	pc := PingConfig{Type: "tcp"}
-	if npc, err := fetchPingConfig(*master); err == nil {
+	if npc, err := fetchPingConfig(*master, cfg.Debug); err == nil {
 		pc = npc
 		log.Printf("ping-config: type=%s nodes=%d", pc.Type, len(pc.Nodes))
 	} else {
@@ -569,7 +603,7 @@ func main() {
 		t := time.NewTicker(configTTL)
 		defer t.Stop()
 		for range t.C {
-			if npc, err := fetchPingConfig(*master); err == nil {
+			if npc, err := fetchPingConfig(*master, cfg.Debug); err == nil {
 				cfgStore.Store(npc)
 				log.Printf("ping-config refreshed: type=%s nodes=%d", npc.Type, len(npc.Nodes))
 			}
