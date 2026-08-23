@@ -103,18 +103,35 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// spaFallback 用 NotFound 处理器托管前端 dist/，未知路径回退 index.html，
-// 从而支持 Vue History 路由（/detail/:id 等）。与 chi 版本的 catch-all 语法无关，最稳妥。
+// spaFallback 托管前端 dist/：先放行静态资源，其余非 /api 路径回退到 index.html，
+// 从而支持 Vue History 路由（/detail/:id 等）。
 func spaFallback(r chi.Router, root http.Dir) {
-	fs := http.FileServer(root)
+	rootStr := string(root)
+	// 显式托管静态资源，避免 http.FileServer 在 NotFound 回调里触发重定向循环。
+	r.Handle("/assets/*", http.FileServer(root))
+	r.Handle("/favicon.svg", http.FileServer(root))
+	r.Handle("/icons.svg", http.FileServer(root))
 	r.NotFound(func(w http.ResponseWriter, req *http.Request) {
 		if strings.HasPrefix(req.URL.Path, "/api") {
 			http.NotFound(w, req)
 			return
 		}
-		if _, err := os.Stat(filepath.Join(string(root), req.URL.Path)); os.IsNotExist(err) {
-			req.URL.Path = "/index.html"
+		// 真实文件（如 vite 构建产物）直接按文件服务；不存在的路径回退到 SPA 入口。
+		if _, err := os.Stat(filepath.Join(rootStr, req.URL.Path)); err == nil {
+			http.FileServer(root).ServeHTTP(w, req)
+			return
 		}
-		fs.ServeHTTP(w, req)
+		serveIndexHTML(w, rootStr)
 	})
+}
+
+func serveIndexHTML(w http.ResponseWriter, root string) {
+	path := filepath.Join(root, "index.html")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		http.Error(w, "index.html not found", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write(data)
 }
