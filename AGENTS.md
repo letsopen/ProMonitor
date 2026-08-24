@@ -5,9 +5,12 @@
 - **被控 Agent**: Go 单二进制，零运行时依赖，按 `COLLECT_INTERVAL`（默认 30s）上报实时数据
 - **前端**: Vue3 + Vite + Element Plus（单页应用）
 - **数据库**: SQLite（单文件 `promonitor.db`，WAL 模式，纯 Go 驱动 modernc，无 cgo）
-- **部署**: Docker，运行期基础镜像 **Alpine 3.21**；构建期 `golang:1.23-alpine`
-- **源码构建下限**: Go ≥ 1.20（modernc.org/sqlite 要求 1.20、gopsutil/v4 要求 1.18）。
-  目标机无需装 Go——Docker 构建在 builder 阶段完成，或直接使用 `bin/` 预编译静态二进制。
+- **部署**: Docker，运行期基础镜像 **Alpine 3.21**；镜像内**零编译**——Go 二进制由 CI 交叉编译、前端 dist 由 CI 构建，Dockerfile 仅做组装 COPY
+- **源码构建下限**: Go ≥ 1.18（modernc.org/sqlite 要求 1.20、gopsutil/v4 要求 1.18；本地验证用 Go 1.23）。
+  目标机无需装 Go——Docker 镜像复用 CI 产出的 `bin/` 静态二进制，或直接使用 `bin/` 预编译静态二进制。
+- **交叉编译（linux/amd64、linux/arm64）由 GitHub Actions 完成**：见 `.github/workflows/build-binaries.yml`。
+  push 到 `main` 产出 workflow artifacts；推送 `v*` 标签自动发布 GitHub Release（含 `promonitor-server_*` / `promonitor-agent_*`）。
+  **本地不再需要手工编译 linux 二进制包**，日常开发只需在宿主平台 `go build ./...` 做编译校验即可。
 
 ## 目录结构
 ```
@@ -24,8 +27,8 @@ agent/       Go 被控 Agent（gopsutil 采集 + HMAC 上报）
 migrations/  SQLite 建表 SQL 参考（实际由 server 启动时自动执行内联 schema）
 scripts/     smoke.mjs（端到端冒烟测试）
 src/         Vue 前端
-bin/         预编译静态二进制（linux amd64/arm64，供非 Docker 部署直接取用）
-Dockerfile / docker-compose.yml / .dockerignore   容器化部署
+bin/         预编译静态二进制（linux amd64/arm64，由 CI 生成，不提交到仓库，供非 Docker 部署直接取用）
+Dockerfile / docker-compose.yml / .dockerignore   容器化部署（镜像由 CI 构建推送 GHCR，本地不编译）
 ```
 
 ## 架构与数据流
@@ -75,17 +78,20 @@ ping 节点清单不再通过环境变量维护，而是通过管理后台“延
 
 ## 部署（Docker，推荐）
 
+> 镜像由 GitHub Actions 构建并推送 GHCR（`ghcr.io/letsopen/promonitor:latest`，见 `.github/workflows/docker-image.yml`），
+> 本地/服务器只需 pull，无需安装 Go/Node，也不执行 docker build。
+
 ### docker run（推荐，主控）
 ```
 # TCP 探测（默认）
 docker run -d --name promonitor --restart unless-stopped -p 9000:9000 \
   -e HMAC_SECRET='<随机长串>' -e ADMIN_PASS='<初始密码>' -e SESSION_SECRET='<随机串>' \
-  -e PING_TYPE=tcp -v promonitor-data:/app/data promonitor:latest
+  -e PING_TYPE=tcp -v promonitor-data:/app/data ghcr.io/letsopen/promonitor:latest
 
 # ICMP 探测：必须加 --cap-add NET_RAW（Alpine 默认无 CAP_NET_RAW，不加则探测全失败）
 docker run -d --name promonitor --restart unless-stopped -p 9000:9000 --cap-add NET_RAW \
   -e HMAC_SECRET='<随机长串>' -e ADMIN_PASS='<初始密码>' -e SESSION_SECRET='<随机串>' \
-  -e PING_TYPE=icmp -v promonitor-data:/app/data promonitor:latest
+  -e PING_TYPE=icmp -v promonitor-data:/app/data ghcr.io/letsopen/promonitor:latest
 # 访问 http://<host>:9000 ；数据持久化在 promonitor-data 卷
 # 进入管理后台 → 延迟节点 中添加探测节点（id/name/ip/port），被控会自动拉取
 ```
@@ -96,19 +102,19 @@ docker run -d --name promonitor --restart unless-stopped -p 9000:9000 --cap-add 
 docker run -d --name promonitor-agent --restart unless-stopped --network host \
   -e MASTER_URL='http://<主控IP>:9000' -e HMAC_SECRET='<与主控一致>' \
   -e SERVER_ID='web-01' -e SERVER_NAME='阿里云-杭州' -e SERVER_IP='10.0.0.5' \
-  promonitor:latest promonitor-agent
+  ghcr.io/letsopen/promonitor:latest promonitor-agent
 
 # ICMP 探测：同样需要 --cap-add NET_RAW
 docker run -d --name promonitor-agent --restart unless-stopped --network host --cap-add NET_RAW \
   -e MASTER_URL='http://<主控IP>:9000' -e HMAC_SECRET='<与主控一致>' \
   -e SERVER_ID='web-01' -e SERVER_NAME='阿里云-杭州' -e SERVER_IP='10.0.0.5' \
-  promonitor:latest promonitor-agent
+  ghcr.io/letsopen/promonitor:latest promonitor-agent
 ```
 
 ### docker compose（备选）
 ```
 cp .env.example .env      # 填 HMAC_SECRET、ADMIN_PASS，可选填 PING_TYPE
-docker compose up -d --build
+docker compose up -d      # 拉取 ghcr.io 镜像并启动（无需本地构建）
 # 访问 http://<host>:9000 ；数据持久化在 promonitor-data 卷
 # 使用 ICMP 时需在 docker-compose.yml 的 promonitor 服务加 cap_add: [NET_RAW]
 # 进入管理后台 → 延迟节点 中添加探测节点

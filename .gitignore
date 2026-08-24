@@ -14,6 +14,13 @@ smoke*.log
 .plan/
 .todo/
 .websearch/
+.codeartsdoer/
+
+# 工具（技能）安装产生的目录，非项目内容
+skills/
 
 # local go build caches
 .gocache*/
+
+# 本地编译产物（Windows 宿主 go build 生成）
+*.exe

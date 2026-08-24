@@ -60,7 +60,7 @@ bin/       预编译静态二进制（linux amd64/arm64，供非 Docker 部署�
 
 ```bash
 # 拉取最新镜像（首次）或更新
-docker pull ghcr.io/letsopen/promonitor:latest
+docker pull ghcr.io/letsopen/ghcr.io/letsopen/promonitor:latest
 ```
 
 > 私有仓库的镜像默认**私有**：如需公开拉取，到 GitHub →
@@ -71,8 +71,8 @@ docker pull ghcr.io/letsopen/promonitor:latest
 ### 方式 A：docker run（推荐）
 
 ```bash
-# 1) 先构建镜像（首次或代码更新后）
-docker build -t promonitor:latest .
+# 1) 拉取 CI 构建的镜像（首次或代码更新后，无需本地构建）
+docker pull ghcr.io/letsopen/ghcr.io/letsopen/promonitor:latest
 
 # 2) 启动主控（TCP 延迟探测，默认）
 docker run -d --name promonitor --restart unless-stopped \
@@ -82,7 +82,7 @@ docker run -d --name promonitor --restart unless-stopped \
   -e SESSION_SECRET='<随机串>' \
   -e PING_TYPE=tcp \
   -v promonitor-data:/app/data \
-  promonitor:latest
+  ghcr.io/letsopen/promonitor:latest
 
 # 3) 访问面板 → 管理后台 → 延迟节点 → 添加探测节点（id/name/ip/port）
 #   被控会自动从主控拉取节点清单，无需在环境变量配置
@@ -100,7 +100,7 @@ docker run -d --name promonitor --restart unless-stopped \
   -e SESSION_SECRET='<随机串>' \
   -e PING_TYPE=icmp \
   -v promonitor-data:/app/data \
-  promonitor:latest
+  ghcr.io/letsopen/promonitor:latest
 ```
 
 > 提示：`docker run` 无法直接读取 `.env`，密钥用 `-e KEY=value` 逐项传入；
@@ -110,7 +110,7 @@ docker run -d --name promonitor --restart unless-stopped \
 ```bash
 docker stop promonitor && docker rm promonitor   # 停止并移除容器（数据在 promonitor-data 卷里保留）
 docker logs -f promonitor                        # 查看日志
-docker build -t promonitor:latest . && docker run ...   # 拉新代码后重新构建再启动
+docker pull ghcr.io/letsopen/promonitor:latest && docker run ...   # 拉取新镜像后重新启动
 ```
 
 ### 方式 B：docker compose（备选）
@@ -120,8 +120,8 @@ docker build -t promonitor:latest . && docker run ...   # 拉新代码后重新�
 cp .env.example .env
 #   编辑 .env，至少填入 HMAC_SECRET（被控/主控必须一致）与 ADMIN_PASS
 
-# 2) 构建并启动（Alpine 3.21 运行镜像，内部用 golang:1.23-alpine 构建）
-docker compose up -d --build
+# 2) 拉取并启动（镜像由 GitHub Actions 构建推送 GHCR，本地仅 pull，不执行构建）
+docker compose up -d
 
 # 3) 访问面板
 #   http://<你的服务器IP>:9000
@@ -155,7 +155,7 @@ docker run -d --name promonitor-agent --restart unless-stopped \
   -e SERVER_ID='web-01' \
   -e SERVER_NAME='阿里云-杭州' \
   -e SERVER_IP='10.0.0.5' \
-  promonitor:latest promonitor-agent
+  ghcr.io/letsopen/promonitor:latest promonitor-agent
 ```
 
 **若主控配置了 ICMP 延迟探测**：被控容器同样需要 `--cap-add NET_RAW`，否则 ICMP 探测全部失败：
@@ -169,7 +169,7 @@ docker run -d --name promonitor-agent --restart unless-stopped \
   -e SERVER_ID='web-01' \
   -e SERVER_NAME='阿里云-杭州' \
   -e SERVER_IP='10.0.0.5' \
-  promonitor:latest promonitor-agent
+  ghcr.io/letsopen/promonitor:latest promonitor-agent
 ```
 
 > `--network host`：让容器直接使用宿主机网络，便于访问主控并让探测流量走宿主网络栈
@@ -179,8 +179,8 @@ docker run -d --name promonitor-agent --restart unless-stopped \
 ### 方式 B：直接跑二进制
 
 取二进制（二选一）：
-- 直接用仓库 `bin/promonitor-agent-linux-amd64`（arm64 用 `...-arm64`）。
-- 或从镜像里拷出：`docker create --name tmp promonitor:latest && docker cp tmp:/usr/local/bin/promonitor-agent ./ && docker rm tmp`。
+- 直接用仓库 `bin/promonitor-agent_linux_amd64`（arm64 用 `bin/promonitor-agent_linux_arm64`）。
+- 或从镜像里拷出：`docker create --name tmp ghcr.io/letsopen/promonitor:latest && docker cp tmp:/usr/local/bin/promonitor-agent ./ && docker rm tmp`。
 
 运行（环境变量或命令行 flag 均可）：
 ```bash
@@ -251,8 +251,8 @@ flag 与环境变量对照：
 `gopsutil/v4` 的最低要求分别为 1.20 / 1.18。因此：
 
 - ❌ 无法用 debian 11 默认软件源的 Go 1.15 **从源码直接构建**（驱动底层卡死，非业务代码问题）。
-- ✅ **Docker 部署完全规避此问题**：构建发生在 `golang:1.23-alpine` builder 阶段，运行期是
-  `alpine:3.21` 只放 `CGO_ENABLED=0` 静态二进制，**目标机不需要安装任何版本的 Go**。
+- ✅ **Docker 部署完全规避此问题**：Go 二进制由 GitHub Actions（`golang:1.23`）交叉编译为
+  `CGO_ENABLED=0` 静态二进制，运行期 `alpine:3.21` 镜像只做组装，**目标机不需要安装任何版本的 Go**。
 - ✅ 若不使用 Docker、直接在目标机跑二进制：直接用仓库 `bin/` 下已编译好的
   `linux-amd64` / `linux-arm64` 静态二进制即可，同样不需要目标机装 Go。
 
