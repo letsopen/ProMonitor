@@ -1,8 +1,9 @@
 # 依赖与构建产物（容器内会重新安装/构建）
 node_modules
-dist
-bin
 .gotool
+# 注意：bin/ 与 dist/ 不再忽略——均由 CI 构建产出后下载进构建上下文，
+# 由 Dockerfile 直接 COPY（bin/ 存 Go 静态二进制、dist/ 存前端产物）。
+# bin/ 与 dist/ 本身仍由 .gitignore 排除、不入库。
 
 # 本地数据、日志、环境变量
 *.db

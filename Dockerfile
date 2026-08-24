@@ -1,30 +1,12 @@
 # syntax=docker/dockerfile:1
 
-# ========== 1. 后端构建（主控 + 被控，纯静态二进制） ==========
-FROM golang:1.23-alpine AS gobuilder
-WORKDIR /src
-# 先拷贝 go.mod/go.sum 并下载依赖，充分利用构建缓存
-COPY server/go.mod server/go.sum ./server/
-COPY agent/go.mod agent/go.sum ./agent/
-RUN cd server && go mod download
-RUN cd agent && go mod download
-COPY server/ ./server/
-COPY agent/ ./agent/
-# CGO_ENABLED=0 生成不依赖 libc 的静态二进制，可直接跑在 alpine/musl 上
-# 注意：server 的 main 包在 cmd/server 子目录，必须用 ./cmd/server 构建
-RUN cd server && CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/promonitor-server ./cmd/server
-RUN cd agent  && CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/promonitor-agent .
+# 纯运行期镜像：Go 二进制与前端 dist 全部由 GitHub Actions 编译产出，
+# 镜像内不执行任何编译（无 golang/node 构建阶段）。
+#   - bin/promonitor-{server,agent}_linux_amd64  由 build-binaries 工作流交叉编译
+#   - dist/                                      由 docker-image 工作流的前端 job 构建
+# CI 在 docker build 前把两份产物下载到构建上下文，这里仅做组装。
+# 注意：本 Dockerfile 仅供 CI 使用，本地 docker build 需先自行准备 bin/ 与 dist/。
 
-# ========== 2. 前端构建 ==========
-FROM node:22-alpine AS webuilder
-WORKDIR /web
-# 复制 lock 文件并用 npm ci：保证 CI 与本地依赖树完全一致、可复现构建
-COPY package.json package-lock.json ./
-RUN npm ci --no-audit --no-fund
-COPY . .
-RUN npm run build
-
-# ========== 3. 运行期（Alpine 3.21） ==========
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
@@ -34,9 +16,11 @@ ENV PORT=9000 \
     HMAC_SECRET="" \
     ADMIN_PASS="" \
     SESSION_SECRET="change-me-session-secret"
-COPY --from=gobuilder /out/promonitor-server /usr/local/bin/promonitor-server
-COPY --from=gobuilder /out/promonitor-agent  /usr/local/bin/promonitor-agent
-COPY --from=webuilder /web/dist /app/dist
+# CI 预编译的静态二进制（CGO_ENABLED=0，可直接跑在 alpine/musl 上）
+COPY bin/promonitor-server_linux_amd64 /usr/local/bin/promonitor-server
+COPY bin/promonitor-agent_linux_amd64  /usr/local/bin/promonitor-agent
+# CI 构建的前端产物
+COPY dist/ /app/dist
 EXPOSE 9000
 VOLUME ["/app/data"]
 CMD ["promonitor-server"]

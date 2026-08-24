@@ -1,9 +1,9 @@
+# 镜像由 GitHub Actions 构建并推送 GHCR（见 .github/workflows/docker-image.yml），
+# 本地不再执行 docker build —— 直接 pull CI 产出的镜像。
+# 用法：cp .env.example .env 填写密钥后执行 `docker compose up -d`（首次会自动 pull）。
 services:
   promonitor:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: promonitor:latest
+    image: ghcr.io/letsopen/promonitor:latest
     container_name: promonitor
     restart: unless-stopped
     ports:

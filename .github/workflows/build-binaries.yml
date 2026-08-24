@@ -1,0 +1,86 @@
+name: build-binaries
+
+# 交叉编译 linux/amd64 与 linux/arm64 的静态二进制（主控 + 被控）。
+# 两种用法：
+#   1) 被其他工作流通过 workflow_call 复用（如 docker-image.yml 直接取用 bin-linux-amd64，
+#      避免在镜像内重复编译）；
+#   2) 手动 workflow_dispatch 单独发布 GitHub Release（推送 v* 标签时由 docker-image.yml 调用，
+#      统一产出「二进制 + 镜像 + Release」）。
+# 注意：不再挂 push 触发器，避免与调用方（docker-image.yml）在 tag 推送时重复运行。
+on:
+  workflow_call:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          check-latest: true
+
+      # 主控 server：CGO_ENABLED=0 生成不依赖 libc 的静态二进制，可直接跑在 alpine/musl 上
+      - name: Build promonitor-server
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p bin
+          cd server
+          go mod download
+          go build -ldflags="-s -w" -o "../bin/promonitor-server_${{ matrix.goos }}_${{ matrix.goarch }}" ./cmd/server
+
+      # 被控 agent
+      - name: Build promonitor-agent
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p bin
+          cd agent
+          go mod download
+          go build -ldflags="-s -w" -o "../bin/promonitor-agent_${{ matrix.goos }}_${{ matrix.goarch }}" .
+
+      - name: Show built binaries
+        run: ls -lh bin
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: bin/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 创建 GitHub Release 所需
+    steps:
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

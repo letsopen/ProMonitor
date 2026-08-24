@@ -2,8 +2,11 @@ name: build-and-push-docker-image
 
 # 触发条件：
 #   - push 到 main 分支（构建并推送 latest 镜像）
-#   - 推送 v* 标签（如 v1.2.3，构建并推送语义化版本镜像）
+#   - 推送 v* 标签（如 v1.2.3，构建并推送语义化版本镜像 + 调用 build-binaries 发布 Release）
 #   - 手动触发（Actions 页面 Run workflow）
+#
+# 镜像内零编译：Go 二进制由 build-binaries 工作流交叉编译，前端 dist 在本工作流前端 job 构建，
+# 两者作为 workflow artifacts 下载进构建上下文后，由 Dockerfile 纯组装 COPY。
 on:
   push:
     branches: [main]
@@ -14,7 +17,41 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
+  # 复用 build-binaries 工作流交叉编译产物（amd64 + arm64），
+  # 后续 docker 构建仅取用 amd64 二进制，避免在镜像内重复编译。
+  binaries:
+    uses: ./.github/workflows/build-binaries.yml
+    permissions:
+      contents: write # 允许被调用方在 tag 推送时创建 Release
+
+  # 前端构建：产出 dist/，与 Go 二进制一样不进入镜像构建阶段
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Upload dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist
+          if-no-files-found: error
+
   build:
+    needs: [binaries, frontend]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -27,6 +64,23 @@ jobs:
       # GHCR 要求镜像名全部小写；github.repository 可能含大写（如 ProMonitor）
       - name: Lowercase image name for GHCR
         run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      # 取用 build-binaries 工作流产出的 amd64 静态二进制，供 Dockerfile COPY
+      - name: Download Go binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: bin-linux-amd64
+          path: bin
+
+      # 取用前端 job 构建的 dist，供 Dockerfile COPY
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Verify artifacts
+        run: ls -lh bin dist
 
       # 仅构建 linux/amd64（本服务部署目标均为 x86_64 服务器）；
       # 不做 arm64，避免 QEMU 模拟交叉编译导致构建时间过长
