@@ -19,6 +19,10 @@ ENV PORT=9000 \
 # CI 预编译的静态二进制（CGO_ENABLED=0，可直接跑在 alpine/musl 上）
 COPY bin/promonitor-server_linux_amd64 /usr/local/bin/promonitor-server
 COPY bin/promonitor-agent_linux_amd64  /usr/local/bin/promonitor-agent
+# GitHub Actions artifact 下载可能丢失可执行权限位，缺失 +x 会导致 runc 报
+# "exec: ...: executable file not found in $PATH"（Go exec.LookPath 对无 x 位文件的行为），
+# 这里显式补回执行权限（仅改权限，不算编译）。
+RUN chmod +x /usr/local/bin/promonitor-server /usr/local/bin/promonitor-agent
 # CI 构建的前端产物
 COPY dist/ /app/dist
 EXPOSE 9000
