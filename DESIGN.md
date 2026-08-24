@@ -74,14 +74,14 @@
 - `metrics_agg(server_id, ts, cpu_avg, mem_avg, disk_avg, net_in_avg, net_out_avg, ping_nodes TEXT)` — 聚合结果。**ts 为 unix 秒整数**（排序/保留期清理都靠它）。50 节点压成 1 行 JSON数组。
 - `latest_snapshot(server_id PK, cpu, mem, disk, net_in, net_out, pings, updated_at)` — 列表/详情实时读。`server_id` 外键 `ON DELETE CASCADE`。
 - `admin_users(username PK, password_hash, created_at)` — 单 admin。
-- **30 天保留**：不做分区（SQLite 无原生分区），由应用层 `PruneOld(30)` 执行 `DELETE FROM metrics_agg WHERE ts < now-30d`，随后 `VACUUM` 回收空间。启动时与每日定时各跑一次。数据量极小，`DELETE` + `VACUUM` 远快于 PostgreSQL 分区 `DROP`，且更简单。
+- **保留期可配置**：不做分区（SQLite 无原生分区），由应用层 `PruneOld(RETENTION_DAYS)`（默认 7 天）执行 `DELETE FROM metrics_agg WHERE ts < now-retention`，随后 `VACUUM` 回收空间。启动时与每日定时各跑一次。数据量极小，`DELETE` + `VACUUM` 远快于 PostgreSQL 分区 `DROP`，且更简单。
 - 索引：`metrics_agg(server_id, ts DESC)`；`latest_snapshot(server_id)`。
 - **WAL 模式 + busy_timeout + 串行连接**：SQLite 单写者，连接数设为 1 串行化，彻底避免 `database is locked`；写入极低频（每被控每 10 分钟 1 行）+ 轮询读取，1 连接绰绰有余。
 
 ## 6. 实时展示
 - 数据源：`latest_snapshot`（重启后也能立刻展示上次落库的最新值，因为列表/详情都直接读 SQLite，不依赖内存）。
 - 列表页 / 详情页轮询 `GET /api/servers/latest`，间隔 **5–10s**。
-- 详情页进入时拉一次 30 天 `metrics_agg` 渲染历史曲线（前端按区间降采样：近 24h 用全量 144 点，更长区间按小时均值再聚合），之后轮询追加最新点。
+- 详情页进入时拉一次保留期内 `metrics_agg` 渲染历史曲线（前端按区间降采样：近 24h 用全量 144 点，更长区间按小时均值再聚合），之后轮询追加最新点。
 - 详情页后续可升级为 SSE 单向推送（自托管常驻进程无云函数冷启动顾虑，SSE 很合适）；**不采用 WebSocket**。
 
 ## 7. 鉴权（匿名列表/详情 + 管理页登录）

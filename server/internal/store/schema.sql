@@ -1,5 +1,5 @@
 -- ProMonitor 初始化 schema（由 server 启动时自动执行，无需手动运行）
--- SQLite 单文件 + WAL；30 天保留由应用层 PruneOld() 执行（DELETE + VACUUM）。
+-- SQLite 单文件 + WAL；保留期（RETENTION_DAYS，默认 7 天）由应用层 PruneOld() 执行（DELETE + VACUUM）。
 
 PRAGMA foreign_keys = ON;
 

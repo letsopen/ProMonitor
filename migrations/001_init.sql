@@ -1,7 +1,7 @@
 -- ProMonitor 初始化迁移（SQLite，单文件 + WAL）
 -- 说明：服务端启动时已通过 server/internal/store/store.go 内嵌 schemaDDL 自动执行等价 DDL，
 --       本文件仅作为人工审阅/手动初始化的参考，内容与内嵌 schema 保持一致。
--- 30 天保留由应用层 PruneOld() 执行（DELETE + VACUUM），不依赖分区。
+-- 保留期（RETENTION_DAYS，默认 7 天）由应用层 PruneOld() 执行（DELETE + VACUUM），不依赖分区。
 
 PRAGMA foreign_keys = ON;
 

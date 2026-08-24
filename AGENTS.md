@@ -15,7 +15,7 @@
 ## 目录结构
 ```
 server/      Go 主控后端
-  cmd/server/main.go        入口：聚合器+API+静态托管+30天保留清理
+  cmd/server/main.go        入口：聚合器+API+静态托管+保留期清理（RETENTION_DAYS）
   internal/config           环境变量
   internal/store            SQLite 存储层（modernc 纯 Go 驱动，内联 schema，无 cgo、无 embed）
   internal/ingest           HMAC 验签 + 写入聚合缓冲
@@ -48,7 +48,7 @@ Dockerfile / docker-compose.yml / .dockerignore   容器化部署（镜像由 CI
 SQLite (promonitor.db) + Vue 前端轮询
 
 Vue前端 <--GET /api/servers(轮询10s)-- 读取最新快照(latest_snapshot JOIN)
-Vue前端 <--GET /api/servers/:id/metrics-- 读取30天聚合历史
+Vue前端 <--GET /api/servers/:id/metrics-- 读取保留期内聚合历史（RETENTION_DAYS，默认 7 天）
 ```
 
 ## 关键设计决策
@@ -60,7 +60,7 @@ Vue前端 <--GET /api/servers/:id/metrics-- 读取30天聚合历史
 - **被控历史数据可靠性**：Agent 本地 SQLite 持久化待上传记录，后台按批量（50 条/次）+ 指数退避重试，成功后删除；恢复后自动续传。
 - **缓存 = 纯进程内内存**，无 Redis（资源敏感、单实例）。
 - **首次上报即注册**：`/api/ingest` 处理时异步 `UpsertServer`，被控无需先在管理页添加。
-- **30 天保留**：SQLite 不做分区，应用层每日 `PruneOld(30)` 删除过期行并 `VACUUM`。
+- **保留期可配置**：SQLite 不做分区，应用层每日 `PruneOld(RETENTION_DAYS)`（默认 7 天，最小 1）删除过期行并 `VACUUM`。
 - **ping 无效判定**：延迟 >1000ms 不计入均值（哨兵值 -1）。
 - **鉴权**：单 admin，密码 bcrypt + httpOnly Cookie 签名会话；列表/详情匿名，管理页 `RequireAdmin` 中间件服务端拦截。
 - **SQLite 连接策略**：WAL + busy_timeout + 单连接串行，避免 `database is locked`。
@@ -72,7 +72,7 @@ Vue前端 <--GET /api/servers/:id/metrics-- 读取30天聚合历史
 - 传输安全：自托管/容器内由前置 nginx 反代终结 TLS（主控本身不内置 HTTPS）。
 
 ## 环境变量（主控）
-`DB_PATH`(必填，容器默认 /app/data/promonitor.db) / `HMAC_SECRET`(必填) / `ADMIN_USER`(默认 admin) / `ADMIN_PASS`(首次种子) / `SESSION_SECRET` / `PORT`(默认 9000) / `FRONTEND_DIR`(默认 ./dist) / `PING_TYPE`(默认 tcp)
+`DB_PATH`(必填，容器默认 /app/data/promonitor.db) / `HMAC_SECRET`(必填) / `ADMIN_USER`(默认 admin) / `ADMIN_PASS`(首次种子) / `SESSION_SECRET` / `PORT`(默认 9000) / `FRONTEND_DIR`(默认 ./dist) / `PING_TYPE`(默认 tcp) / `RETENTION_DAYS`(默认 7，历史保留天数)
 
 ping 节点清单不再通过环境变量维护，而是通过管理后台“延迟节点”页面存 SQLite `ping_nodes` 表。
 

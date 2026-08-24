@@ -21,6 +21,8 @@ type Config struct {
 	PingType string
 	// Debug 控制是否打印所有 HTTP 请求/响应报文（JSON 美化），默认 true。
 	Debug bool
+	// RetentionDays 历史聚合数据保留天数（默认 7，最小 1），由 PruneOld 每日清理。
+	RetentionDays int
 }
 
 func Load() *Config {
@@ -41,6 +43,14 @@ func Load() *Config {
 	debugStr := strings.ToLower(strings.TrimSpace(os.Getenv("DEBUG")))
 	debug := debugStr != "false" && debugStr != "0" && debugStr != "off"
 
+	// 历史保留天数：默认 7 天；非正数或非法值回退默认（0 会被误认为“立即清理”，必须拦截）。
+	retention := 7
+	if v := os.Getenv("RETENTION_DAYS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 {
+			retention = n
+		}
+	}
+
 	return &Config{
 		Port:          port,
 		DBPath:        get("DB_PATH", "./promonitor.db"),
@@ -51,5 +61,6 @@ func Load() *Config {
 		FrontendDir:   get("FRONTEND_DIR", "./dist"),
 		PingType:      pingType,
 		Debug:         debug,
+		RetentionDays: retention,
 	}
 }

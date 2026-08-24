@@ -22,7 +22,7 @@ CPU / 内存 / 硬盘 / 网络 / 多节点 Ping 延迟并上报；主控聚合�
    ▼
 主控 Server (Go :9000)
    ├─ /api/ingest 刷新 latest_snapshot（列表/详情读它，极轻，不落历史）
-   ├─ /api/history 直接落库 metrics_agg（保留 30 天）
+   ├─ /api/history 直接落库 metrics_agg（保留 RETENTION_DAYS，默认 7 天）
    └─ 托管前端 dist/  +  REST API
             │
             ▼
@@ -221,7 +221,7 @@ flag 与环境变量对照：
 ## 数据源 / 实时展示
 
 - 列表页、详情页读取 `latest_snapshot`（每被控最新一组指标），前端每 **10s** 轮询一次。
-- 详情页历史曲线读取 `metrics_agg`（每 10 分钟 1 行均值），保留 30 天。
+- 详情页历史曲线读取 `metrics_agg`（每 10 分钟 1 行均值），保留期由 `RETENTION_DAYS` 控制（默认 7 天）。
 - 实时高频上报**只刷新 latest_snapshot，不落历史库**；历史聚合由被控在本地完成后再上报，对服务端资源极友好。
 
 ---
@@ -238,6 +238,7 @@ flag 与环境变量对照：
 | `SESSION_SECRET` | 否 | `change-me-session-secret` | 会话 Cookie 签名密钥 |
 | `FRONTEND_DIR` | 否 | `./dist` | 前端静态目录 |
 | `PING_TYPE`    | 否 | `tcp`   | 延迟探测方式：`tcp`（TCP 端口探测）或 `icmp`（需容器 `--cap-add NET_RAW`）|
+| `RETENTION_DAYS` | 否 | `7` | 历史聚合数据保留天数（最小 1），超期数据每日自动清理 |
 
 > 节点清单不再通过环境变量维护，部署后进入 **管理后台 → 延迟节点** 添加（存 SQLite `ping_nodes` 表）。
 

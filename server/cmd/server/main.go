@@ -46,8 +46,8 @@ func main() {
 		}
 	}
 
-	// 启动时立即执行一次 30 天保留清理，并每日定时清理 + 回收空间
-	if n, err := st.PruneOld(ctx, 30); err != nil {
+	// 启动时立即执行一次保留期清理（RETENTION_DAYS，默认 7 天），并每日定时清理 + 回收空间
+	if n, err := st.PruneOld(ctx, cfg.RetentionDays); err != nil {
 		log.Printf("warn: initial prune failed: %v", err)
 	} else if n > 0 {
 		_ = st.Vacuum(ctx)
@@ -60,7 +60,7 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				if n, err := st.PruneOld(ctx, 30); err != nil {
+				if n, err := st.PruneOld(ctx, cfg.RetentionDays); err != nil {
 					log.Printf("warn: prune failed: %v", err)
 				} else if n > 0 {
 					_ = st.Vacuum(ctx)
