@@ -26,7 +26,6 @@ const rangeMs: Record<string, number> = {
   '1h': 3600_000,
   '24h': 86_400_000,
   '7d': 7 * 86_400_000,
-  '30d': 30 * 86_400_000,
 }
 
 async function loadPingConfig() {
@@ -91,23 +90,23 @@ function renderCharts() {
   )
 
   // ping：按主控下发的节点配置数生成曲线，每个节点一条且连续展示。
-  // 数据已归一化：-1(超时)→9999ms，0ms 与正延迟均为有效值，不出现断点。
-  // 若某历史行节点数少于配置数，用 9999(超时) 补齐，保证每条配置曲线都有连续数据。
+  // 数据已归一化：-1(超时)→PING_TIMEOUT_MS(3000ms)，0ms 与正延迟均为有效值，不出现断点。
+  // 若某历史行节点数少于配置数，用 PING_TIMEOUT_MS(超时) 补齐，保证每条配置曲线都有连续数据。
   const nodeCount = pingNodeNames.value.length
   const series = []
   for (let i = 0; i < nodeCount; i++) {
     const name = pingNodeNames.value[i] || `节点 ${i + 1}`
     const data = history.value.map((m) => {
       const v = m.ping_nodes?.[i]
-      if (v == null) return 9999 // 该行缺该节点 → 视为超时，保持连续
+      if (v == null) return PING_TIMEOUT_MS // 该行缺该节点 → 视为超时，保持连续
       return +v.toFixed(1)
     })
     series.push({ name, data })
   }
   if (series.length > 0) {
-    lineChart('ping', 'Ping 延迟 (ms，9999=超时)', times, series, 'ms', PING_TIMEOUT_MS)
+    lineChart('ping', `Ping 延迟 (ms，${PING_TIMEOUT_MS}=超时)`, times, series, 'ms', PING_TIMEOUT_MS)
   } else {
-    lineChart('ping', 'Ping 延迟 (ms，9999=超时)', times, [], 'ms', PING_TIMEOUT_MS)
+    lineChart('ping', `Ping 延迟 (ms，${PING_TIMEOUT_MS}=超时)`, times, [], 'ms', PING_TIMEOUT_MS)
   }
 }
 
@@ -172,7 +171,6 @@ watch(timeRange, loadHistory)
             <el-radio-button label="1h">1 小时</el-radio-button>
             <el-radio-button label="24h">24 小时</el-radio-button>
             <el-radio-button label="7d">7 天</el-radio-button>
-            <el-radio-button label="30d">30 天</el-radio-button>
           </el-radio-group>
         </div>
       </div>

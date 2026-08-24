@@ -19,9 +19,10 @@ export function timeAgo(iso: string | undefined): string {
 }
 
 // 从 ping 数组计算有效延迟的 min / avg / max。
-// 约定：归一化后 -1(超时) 已映射为 PingTimeoutMs(9999)，因此 >=9999 视为超时、不参与均值；
-// 0ms 与正延迟均为有效值。返回 timeout 计数供 UI 标注"N 个节点超时"。
-export const PING_TIMEOUT_MS = 9999
+// 约定：归一化后 -1(超时) 已映射为 PingTimeoutMs(3000)，因此 >=3000 视为超时、不参与均值；
+// 0ms 与正延迟均为有效值（合法延迟上限 1000ms，3000 不会误伤）。
+// 返回 timeout 计数供 UI 标注"N 个节点超时"。
+export const PING_TIMEOUT_MS = 3000
 
 export function pingStats(pings: number[] | null | undefined): {
   min: number | null
