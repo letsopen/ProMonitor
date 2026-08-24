@@ -40,6 +40,11 @@ const (
 	maxHistoryRetries        = 5
 	baseBackoff              = 2 * time.Second
 	maxBackoff               = 60 * time.Second
+
+	// 网速合法性上限：100 Gbps。换算：100Gbps = 1e11 bit/s = 1.25e10 B/s，÷1024 得 KB/s。
+	maxNetRateKBps = 100.0 * 1e9 / 8 / 1024 // ≈ 1.2207e7 KB/s
+	netRetryDelay  = 3 * time.Second        // 采集失效后重试间隔
+	netMaxRetries  = 3                        // 采集失效后最多重试次数
 )
 
 // Sample 是实时上报给主控的单次样本（高频，不落库）。
@@ -106,9 +111,9 @@ type AgentConfig struct {
 
 // 全局变量
 var (
-	prevNet gn.IOCountersStat
-	prevTS  time.Time
-	haveP   bool
+	prevNetMap map[string]gn.IOCountersStat // 每个物理网卡的上次读数，用于按接口求速率差
+	prevTS     time.Time
+	havePrev   bool
 )
 
 func env(k, def string) string {
@@ -487,6 +492,110 @@ func prettyJSON(b []byte) string {
 	return out.String()
 }
 
+// isPhysicalNIC 判断是否为物理网卡：排除回环 lo 以及常见虚拟/桥接/容器/隧道接口。
+// 部署目标为 Linux/Alpine，接口命名遵循 Linux 惯例；虚拟接口按名称前缀排除。
+func isPhysicalNIC(name string) bool {
+	lower := strings.ToLower(name)
+	if lower == "lo" {
+		return false
+	}
+	for _, p := range []string{
+		"docker", "veth", "br-", "virbr", "tun", "tap", "bond",
+		"vmnet", "cni", "flannel", "calico", "wg", "dummy", "kube",
+		"vboxnet", "ovs", "pods", "containers",
+	} {
+		if strings.HasPrefix(lower, p) {
+			return false
+		}
+	}
+	return true
+}
+
+// netRateStatus 表示单次网速采样的结果状态。
+type netRateStatus int
+
+const (
+	netWarmup netRateStatus = iota // 尚无上一基准，预热中
+	netValid
+	netInvalid
+)
+
+// netRateOnce 读一次全网卡计数器，仅对物理网卡求上下行速率（KB/s）。
+// 无论本次是否可用，都会把当前读数写入 prevNetMap 作为下一轮基准：
+// 这样网卡重置/计数器回绕后，下一轮（或重试）的 delta 落在极短窗口内，自然回到合法范围，
+// 避免了上一版实现中 uint64 相减下溢产生的离谱速率。
+func netRateOnce(now time.Time) (netIn, netOut float64, st netRateStatus) {
+	cs, err := gn.IOCounters(true)
+	if err != nil || len(cs) == 0 {
+		return 0, 0, netInvalid
+	}
+	var dt float64
+	if havePrev && !prevTS.IsZero() {
+		dt = now.Sub(prevTS).Seconds()
+	}
+	var din, dout int64
+	for _, c := range cs {
+		if !isPhysicalNIC(c.Name) {
+			continue
+		}
+		if p, ok := prevNetMap[c.Name]; ok && dt > 0 {
+			din += int64(c.BytesRecv) - int64(p.BytesRecv)
+			dout += int64(c.BytesSent) - int64(p.BytesSent)
+		}
+		prevNetMap[c.Name] = c
+	}
+	// 清理已消失的物理网卡，避免陈旧基准参与后续 delta
+	for name := range prevNetMap {
+		found := false
+		for _, c := range cs {
+			if c.Name == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			delete(prevNetMap, name)
+		}
+	}
+	prevTS = now
+	if !havePrev || dt <= 0 {
+		havePrev = true
+		return 0, 0, netWarmup
+	}
+	netIn = float64(din) / dt / 1024 // KB/s
+	netOut = float64(dout) / dt / 1024
+	if netIn >= 0 && netOut >= 0 && netIn <= maxNetRateKBps && netOut <= maxNetRateKBps {
+		return netIn, netOut, netValid
+	}
+	return netIn, netOut, netInvalid
+}
+
+// collectNet 采集物理网卡上下行速率（KB/s）。
+// 速率落在 [0, 100Gbps] 之外视为采集数据失效，自动重试采集（delay 3s，最多 3 次）；
+// 预热阶段（首轮无基准）或重试耗尽则返回 0，绝不把离谱值上报到主控。
+func collectNet(now time.Time) (netIn, netOut float64) {
+	in, out, st := netRateOnce(now)
+	switch st {
+	case netValid:
+		return in, out
+	case netWarmup:
+		return 0, 0 // 首轮无基准，直接给 0，不重试
+	default: // netInvalid
+	}
+	for i := 0; i < netMaxRetries; i++ {
+		time.Sleep(netRetryDelay)
+		// 重试时基准已在上一轮刷新，这里用真实当前时间使 delta 落在 3s 窗口内
+		in, out, st = netRateOnce(time.Now())
+		switch st {
+		case netValid:
+			return in, out
+		case netWarmup:
+			return 0, 0
+		}
+	}
+	return 0, 0 // 重试耗尽，放弃本次网速
+}
+
 func collect(cfg AgentConfig, pc PingConfig, now time.Time) *Sample {
 	cpuPct, _ := cpu.Percent(0, false)
 	var cpuVal float64
@@ -510,20 +619,7 @@ func collect(cfg AgentConfig, pc PingConfig, now time.Time) *Sample {
 		diskTotal = du.Total / 1024 / 1024 / 1024 // GB
 	}
 
-	var netIn, netOut float64
-	if cs, err := gn.IOCounters(false); err == nil && len(cs) > 0 {
-		c := cs[0]
-		if haveP && !prevTS.IsZero() {
-			dt := now.Sub(prevTS).Seconds()
-			if dt > 0 {
-				netIn = float64(c.BytesRecv-prevNet.BytesRecv) / dt / 1024   // KB/s
-				netOut = float64(c.BytesSent-prevNet.BytesSent) / dt / 1024  // KB/s
-			}
-		}
-		prevNet = c
-		prevTS = now
-		haveP = true
-	}
+	netIn, netOut := collectNet(now)
 
 	pings := make([]float64, len(pc.Nodes))
 	for i, n := range pc.Nodes {
@@ -578,6 +674,7 @@ func main() {
 	}
 
 	cfg := AgentConfig{Master: *master, Secret: *secret, SID: *sid, Name: *name, IP: *ip, CollectInterval: *interval, Debug: debug}
+	prevNetMap = make(map[string]gn.IOCountersStat)
 
 	pc := PingConfig{Type: "tcp"}
 	if npc, err := fetchPingConfig(*master, cfg.Debug); err == nil {
